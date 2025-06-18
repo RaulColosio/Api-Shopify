@@ -1,0 +1,1417 @@
+<?php
+
+// app/Commands/ShopifySyncCommand.php v41.9 versión ORO
+
+namespace App\Commands;
+
+use CodeIgniter\CLI\BaseCommand;
+use CodeIgniter\CLI\CLI;
+use App\Models\ParentProductModel;
+use App\Models\VariantProductModel;
+use App\Services\ShopifyService;
+use Config\Services;
+
+class ShopifySyncCommand extends BaseCommand
+{
+    protected $group = 'Shopify';
+    protected $name = 'shopify:sync';
+    protected $description = 'Sincroniza productos (detalles y/o stock) desde la BD local a Shopify.';
+    protected $usage = 'shopify:sync [--full | --stock-only | --sku SKU_PADRE] [--limit N] [--offset N] [--skip-image-updates] [--dry-run]';
+    protected $options = [
+        '--full' => 'Sincronización completa de todos los productos (detalles y stock).',
+        '--stock-only' => 'Sincroniza ÚNICAMENTE los niveles de stock.',
+        '--sku' => 'Sincroniza solo el producto padre con el SKU especificado.',
+        '--limit' => 'Limita el número de productos a procesar.',
+        '--offset' => 'Número de productos a saltar al inicio de la consulta (usar con --full o incremental).',
+        '--skip-image-updates' => 'Omite la subida/asociación de imágenes para productos que ya existen (actualizaciones).',
+        '--dry-run' => 'Muestra lo que haría sin realizar cambios reales en Shopify.',
+    ];
+
+    protected ParentProductModel $parentModel;
+    protected VariantProductModel $variantModel;
+    protected ShopifyService $shopifyService;
+    protected $logger;
+    protected string $primaryShopifyLocationId = '68054974700';
+
+    public function __construct()
+    {
+        $this->parentModel = new ParentProductModel();
+        $this->variantModel = new VariantProductModel();
+        $this->shopifyService = new ShopifyService();
+        $this->logger = Services::logger();
+    }
+
+    protected function generateShopifyHandle(string $title): string
+    {
+        $handle = mb_strtolower($title, 'UTF-8');
+        $unwanted_array = [
+            'á' => 'a', 'à' => 'a', 'â' => 'a', 'ä' => 'a', 'ã' => 'a', 'å' => 'a',
+            'é' => 'e', 'è' => 'e', 'ê' => 'e', 'ë' => 'e',
+            'í' => 'i', 'ì' => 'i', 'î' => 'i', 'ï' => 'i',
+            'ó' => 'o', 'ò' => 'o', 'ô' => 'o', 'ö' => 'o', 'õ' => 'o', 'ø' => 'o',
+            'ú' => 'u', 'ù' => 'u', 'û' => 'u', 'ü' => 'u',
+            'ý' => 'y', 'ÿ' => 'y',
+            'ñ' => 'n', 'ç' => 'c', 'š' => 's', 'ž' => 'z',
+            'Á' => 'a', 'À' => 'a', 'Â' => 'a', 'Ä' => 'a', 'Ã' => 'a', 'Å' => 'a',
+            'É' => 'e', 'È' => 'e', 'Ê' => 'e', 'Ë' => 'e',
+            'Í' => 'i', 'Ì' => 'i', 'Î' => 'i', 'Ï' => 'i',
+            'Ó' => 'o', 'Ò' => 'o', 'Ô' => 'o', 'Ö' => 'o', 'Õ' => 'o', 'Ø' => 'o',
+            'Ú' => 'u', 'Ù' => 'u', 'Û' => 'u', 'Ü' => 'u',
+            'Ý' => 'y', 'Ÿ' => 'y',
+            'Ñ' => 'n', 'Ç' => 'c', 'Š' => 's', 'Ž' => 'z'
+        ];
+        $handle = strtr($handle, $unwanted_array);
+        $handle = preg_replace('/[^a-z0-9]+/', '-', $handle);
+        $handle = trim($handle, '-');
+        $handle = preg_replace('/-+/', '-', $handle);
+        if (empty($handle)) {
+            return 'product-' . substr(md5(uniqid(rand(), true)), 0, 8);
+        }
+        return $handle;
+    }
+
+    protected function getWordReplacements(): array
+    {
+        // Tu lista completa de reemplazos de palabras sensibles a mayúsculas/minúsculas
+        return [
+            'BOLIGRAFO' => 'BOLÍGRAFO', 'Boligrafo' => 'Bolígrafo', 'boligrafo' => 'bolígrafo',
+            'PLASTICO' => 'PLÁSTICO', 'Plastico' => 'Plástico', 'plastico' => 'plástico',
+            // ... (Asegúrate de que toda tu lista de reemplazos esté aquí) ...
+            // (He omitido la lista larga por brevedad, pero debe estar completa en tu archivo)
+            'LASER' => 'LÁSER', 'Laser' => 'Láser', 'laser' => 'láser',
+            'DISE?O' => 'DISEÑO', 'Dise?o' => 'Diseño', 'dise?o' => 'diseño',
+            'DISENO' => 'DISEÑO', 'Diseno' => 'Diseño', 'diseno' => 'diseño',
+            'SERIGRAFIA' => 'SERIGRAFÍA', 'Serigrafia' => 'Serigrafía', 'serigrafia' => 'serigrafía',
+            'METALICO' => 'METÁLICO', 'Metalico' => 'Metálico', 'metalico' => 'metálico',
+            'METALICOS' => 'METÁLICOS', 'Metalicos' => 'Metálicos', 'metalicos' => 'metálicos',
+            'METALICA' => 'METÁLICA', 'Metalica' => 'Metálica', 'metalica' => 'metálica',
+            'CLASICA' => 'CLÁSICA', 'clasica' => 'clásica',
+            'DIAMETRO' => 'DIÁMETRO', 'Diametro' => 'Diámetro', 'diametro' => 'diámetro',
+            'NI?O' => 'NIÑO', 'Ni?o' => 'Niño', 'ni?o' => 'niño',
+            'RIGIDA' => 'RÍGIDA', 'Rigida' => 'Rígida', 'rigida' => 'rígida',
+            'NINO' => 'NIÑO', 'Nino' => 'Niño', 'nino' => 'niño',
+            'DESCRIPCION' => 'DESCRIPCIÓN', 'Descripcion' => 'Descripción', 'descripcion' => 'descripción',
+            'ARTICULO' => 'ARTÍCULO', 'Articulo' => 'Artículo', 'articulo' => 'artículo',
+            'ARTICULOS' => 'ARTÍCULOS', 'Articulos' => 'Artículos', 'articulos' => 'artículos',
+            'ELECTRONICO' => 'ELECTRÓNICO', 'Electronico' => 'Electrónico', 'electronico' => 'electrónico',
+            'AUTOMATICO' => 'AUTOMÁTICO', 'Automatico' => 'Automático', 'automatico' => 'automático',
+            'CAPSULA' => 'CÁPSULA', 'Capsula' => 'Cápsula', 'capsula' => 'cápsula',
+            'LAMPARA' => 'LÁMPARA', 'Lampara' => 'Lámpara', 'lampara' => 'lámpara',
+            'MAXIMO' => 'MÁXIMO', 'Maximo' => 'Máximo', 'maximo' => 'máximo',
+            'MINIMO' => 'MÍNIMO', 'Minimo' => 'Mínimo', 'minimo' => 'mínimo',
+            'PRACTICO' => 'PRÁCTICO', 'Practico' => 'Práctico', 'practico' => 'práctico',
+            'RAPIDA' => 'RÁPIDA', 'Rapida' => 'Rápida', 'rapida' => 'rápida',
+            'RAPIDO' => 'RÁPIDO', 'Rapido' => 'Rápido', 'rapido' => 'rápido',
+            'ULTIMO' => 'ÚLTIMO', 'Ultimo' => 'Último', 'ultimo' => 'último',
+            'POLIESTER' => 'POLIÉSTER', 'Poliester' => 'Poliéster', 'poliester' => 'poliéster',
+            'ALGODON' => 'ALGODÓN', 'Algodon' => 'Algodón', 'algodon' => 'algodón',
+            'TECNICA' => 'TÉCNICA', 'Tecnica' => 'Técnica', 'tecnica' => 'técnica',
+            'IMPRESION' => 'IMPRESIÓN', 'Impresion' => 'Impresión', 'impresion' => 'impresión',
+            'SUBLIMACION' => 'SUBLIMACIÓN', 'Sublimacion' => 'Sublimación', 'sublimacion' => 'sublimación',
+            'TAMPOGRAFIA' => 'TAMPOGRAFÍA', 'Tampografia' => 'Tampografía', 'tampografia' => 'tampografía',
+            'PAGINA' => 'PÁGINA', 'Pagina' => 'Página', 'pagina' => 'página',
+            'RETRACTIL' => 'RETRÁCTIL', 'Retractil' => 'Retráctil', 'retractil' => 'retráctil',
+            'TRANSMISION' => 'TRANSMISIÓN', 'Transmision' => 'Transmisión', 'transmision' => 'transmisión',
+            'VACIO' => 'VACÍO', 'Vacio' => 'Vacío', 'vacio' => 'vacío',
+            'FUNCION' => 'FUNCIÓN', 'Funcion' => 'Función', 'funcion' => 'función',
+            'FACILMENTE' => 'FÁCILMENTE', 'Facilmente' => 'Fácilmente', 'facilmente' => 'fácilmente',
+            'FACIL' => 'FÁCIL', 'Facil' => 'Fácil', 'facil' => 'fácil',
+            'FRIA' => 'FRÍA', 'Fria' => 'Fría', 'fria' => 'fría',
+            'FRIAS' => 'FRÍAS', 'Frias' => 'Frías', 'frias' => 'frías',
+            'ANOS' => 'AÑOS', 'Anos' => 'Años', 'anos' => 'años',
+            'DESPUES' => 'DESPUÉS', 'Despues' => 'Después', 'despues' => 'después',
+            'AREA' => 'ÁREA', 'Area' => 'Área', 'area' => 'área',
+            'AREAS' => 'ÁREAS', 'Areas' => 'Áreas', 'areas' => 'áreas',
+            'TRANSFORMACION' => 'TRANSFORMACIÓN', 'Transformacion' => 'Transformación', 'transformacion' => 'transformación',
+            'TRANSPORTACION' => 'TRANSPORTACIÓN', 'Transportacion' => 'Transportación', 'transportacion' => 'transportación',
+            'DISENADA' => 'DISEÑADA', 'Disenada' => 'Diseñada', 'disenada' => 'diseñada',
+            'DISENADO' => 'DISEÑADO', 'Disenado' => 'Diseñado', 'disenado' => 'diseñado',
+            'HABITOS' => 'HÁBITOS', 'Habitos' => 'Hábitos', 'habitos' => 'hábitos',
+            'DIAS' => 'DÍAS', 'Dias' => 'Días', 'dias' => 'días',
+            'DIA' => 'DÍA', 'Dia' => 'Día', 'dia' => 'día',
+            'PEQUENO' => 'PEQUEÑO', 'Pequeno' => 'Pequeño', 'pequeno' => 'pequeño',
+            'PEQUENOS' => 'PEQUEÑOS', 'Pequenos' => 'Pequeños', 'pequenos' => 'pequeños',
+            'PEQUENA' => 'PEQUEÑA', 'Pequena' => 'Pequeña', 'pequena' => 'pequeña',
+            'PEQUENAS' => 'PEQUEÑAS', 'Pequenas' => 'Pequeñas', 'pequenas' => 'pequeñas',
+            'ATENCION' => 'ATENCIÓN', 'Atencion' => 'Atención', 'atencion' => 'atención',
+            'TAMANO' => 'TAMAÑO', 'Tamano' => 'Tamaño', 'tamano' => 'tamaño',
+            'BASCULA' => 'BÁSCULA', 'Bascula' => 'Báscula', 'bascula' => 'báscula',
+            'AUDIFONOS' => 'AUDÍFONOS', 'Audifonos' => 'Audífonos', 'audifonos' => 'audífonos',
+            'BALON' => 'BALÓN', 'Balon' => 'Balón', 'balon' => 'balón',
+            'BATERIA' => 'BATERÍA', 'Bateria' => 'Batería', 'bateria' => 'batería',
+            'BATERIAS' => 'BATERÍAS', 'Baterias' => 'Baterías', 'baterias' => 'baterías',
+            'ADAPTANDOSE' => 'ADAPTÁNDOSE', 'Adaptandose' => 'Adaptándose', 'adaptandose' => 'adaptándose',
+            'PUNZON' => 'PUNZÓN', 'Punzon' => 'Punzón', 'punzon' => 'punzón',
+            'GUIA' => 'GUÍA', 'Guia' => 'Guía', 'guia' => 'guía',
+            'ECOLOGICO' => 'ECOLÓGICO', 'Ecologico' => 'Ecológico', 'ecologico' => 'ecológico',
+            'ECOLOGICA' => 'ECOLÓGICA', 'Ecologica' => 'Ecológica', 'ecologica' => 'ecológica',
+            'BOTON' => 'BOTÓN', 'Boton' => 'Botón', 'boton' => 'botón',
+            'PIZARRON' => 'PIZARRÓN', 'Pizarron' => 'Pizarrón', 'pizarron' => 'pizarrón',
+            'TERMOMETRO' => 'TERMÓMETRO', 'Termometro' => 'Termómetro', 'termometro' => 'termómetro',
+            'UNICAMENTE' => 'ÚNICAMENTE', 'Unicamente' => 'Únicamente', 'unicamente' => 'únicamente',
+            'ALGUN' => 'ALGÚN', 'Algun' => 'Algún', 'algun' => 'algún',
+            'TAPON' => 'TAPÓN', 'Tapon' => 'Tapón', 'tapon' => 'tapón',
+            'OCASION' => 'OCASIÓN', 'Ocasion' => 'Ocasión', 'ocasion' => 'ocasión',
+            'SECCION' => 'SECCIÓN', 'Seccion' => 'Sección', 'seccion' => 'sección',
+            'TAMBIEN' => 'TAMBIÉN', 'Tambien' => 'Tambien', 'tambien' => 'también',
+            'ELASTICO' => 'ELÁSTICO', 'Elastico' => 'Elástico', 'elastico' => 'elástico',
+            'ELASTICOS' => 'ELÁSTICOS', 'Elasticos' => 'Elásticos', 'elasticos' => 'elásticos',
+            'ELASTICA' => 'ELÁSTICA', 'Elastica' => 'Elástica', 'elastica' => 'elástica',
+            'ELASTICAS' => 'ELÁSTICAS', 'Elasticas' => 'Elásticas', 'elasticas' => 'elásticas',
+            'INSTALACION' => 'INSTALACIÓN', 'Instalacion' => 'Instalación', 'instalacion' => 'instalación',
+            'BAMBU' => 'BAMBÚ', 'Bambu' => 'Bambú', 'bambu' => 'bambú',
+            'ESTACION' => 'ESTACIÓN', 'Estacion' => 'Estación', 'estacion' => 'estación',
+            'REPRODUCCION' => 'REPRODUCCIÓN', 'Reproduccion' => 'Reproducción', 'reproduccion' => 'reproducción',
+            'MULTIFUNCION' => 'MULTIFUNCIÓN', 'Multifuncion' => 'Multifunción', 'multifuncion' => 'multifunción',
+            'CONEXION' => 'CONEXIÓN', 'Conexion' => 'Conexión', 'conexion' => 'conexión',
+            'INALAMBRICO' => 'INALÁMBRICO', 'Inalambrico' => 'Inalámbrico', 'inalambrico' => 'inalámbrico',
+            'INALAMBRICOS' => 'INALÁMBRICOS', 'Inalambricos' => 'Inalámbricos', 'inalambricos' => 'inalámbricos',
+            'INALAMBRICA' => 'INALÁMBRICA', 'Inalambrica' => 'Inalámbrica', 'inalambrica' => 'inalámbrica',
+            'INALAMBRICAS' => 'INALÁMBRICAS', 'Inalambricas' => 'Inalámbricas', 'inalambricas' => 'inalámbricas',
+            'MAYORIA' => 'MAYORÍA', 'Mayoria' => 'Mayoría', 'mayoria' => 'mayoría',
+            'ORGANIZACION' => 'ORGANIZACIÓN', 'Organizacion' => 'Organización', 'organizacion' => 'organización',
+            'TECNOLOGIA' => 'TECNOLOGÍA', 'Tecnologia' => 'Tecnología', 'tecnologia' => 'tecnología',
+            'MICROFONO' => 'MICRÓFONO', 'Microfono' => 'Micrófono', 'microfono' => 'micrófono',
+            'INCLINACION' => 'INCLINACIÓN', 'Inclinacion' => 'Inclinación', 'inclinacion' => 'inclinación',
+            'SENAL' => 'SEÑAL', 'Senal' => 'Señal', 'senal' => 'señal',
+            'HERMETICO' => 'HERMÉTICO', 'Hermetico' => 'Hermético', 'hermetico' => 'hermético',
+            'MAGNETICO' => 'MAGNÉTICO', 'Magnetico' => 'Magnético', 'magnetico' => 'magnético',
+            'ERGONOMICO' => 'ERGONÓMICO', 'Ergonomico' => 'Ergonómico', 'ergonomico' => 'ergonómico',
+            'ACRILICO' => 'ACRÍLICO', 'Acrilico' => 'Acrílico', 'acrilico' => 'acrílico',
+            'MUNECAS' => 'MUÑECAS', 'Munecas' => 'Muñecas', 'munecas' => 'muñecas',
+            'MUNECA' => 'MUÑECA', 'Muneca' => 'Muñeca', 'muneca' => 'muñeca',
+            'COMODO' => 'CÓMODO', 'Comodo' => 'Cómodo', 'comodo' => 'cómodo',
+            'COMODOS' => 'CÓMODOS', 'Comodos' => 'Cómodos', 'comodos' => 'cómodos',
+            'COMODA' => 'CÓMODA', 'Comoda' => 'Cómoda', 'comoda' => 'cómoda',
+            'COMODAS' => 'CÓMODAS', 'Comodas' => 'Cómodas', 'comodas' => 'cómodas',
+            'COMPOSICION' => 'COMPOSICIÓN', 'Composicion' => 'Composición', 'composicion' => 'composición',
+            'SENSACION' => 'SENSACIÓN', 'Sensacion' => 'Sensación', 'sensacion' => 'sensación',
+            'CALIDA' => 'CÁLIDA', 'Calida' => 'Cálida', 'calida' => 'cálida',
+            'CALIDAS' => 'CÁLIDAS', 'Calidas' => 'Cálidas', 'calidas' => 'cálidas',
+            'AUTOMOVIL' => 'AUTOMÓVIL', 'Automovil' => 'Automóvil', 'automovil' => 'automóvil',
+            'PRECISION' => 'PRECISIÓN', 'Precision' => 'Precisión', 'precision' => 'precisión',
+            'POSICION' => 'POSICIÓN', 'Posicion' => 'Posición', 'posicion' => 'posición',
+            'DIDACTICO' => 'DIDÁCTICO', 'Didactico' => 'Didáctico', 'didactico' => 'didáctico',
+            'GEOMETRICO' => 'GEOMÉTRICO', 'Geometrico' => 'Geométrico', 'geometrico' => 'geométrico',
+            'GEOMETRICA' => 'GEOMÉTRICA', 'Geometrica' => 'Geométrica', 'geometrica' => 'geométrica',
+            'LOGICO' => 'LÓGICO', 'Logico' => 'Lógico', 'logico' => 'lógico',
+            'COORDINACION' => 'COORDINACIÓN', 'Coordinacion' => 'Coordinación', 'coordinacion' => 'coordinación',
+            'ASI' => 'ASÍ', 'Asi' => 'Así', 'asi' => 'así',
+            'PRESION' => 'PRESIÓN', 'Presion' => 'Presión', 'presion' => 'presión',
+            'JARDIN' => 'JARDÍN', 'Jardin' => 'Jardín', 'jardin' => 'jardín',
+            'FLEXOMETRO' => 'FLEXÓMETRO', 'Flexometro' => 'Flexómetro', 'flexometro' => 'flexómetro',
+            'VALVULA' => 'VÁLVULA', 'Valvula' => 'Válvula', 'valvula' => 'válvula',
+            'PESTANA' => 'PESTAÑA', 'Pestana' => 'Pestaña', 'pestana' => 'pestaña',
+            'PESTANAS' => 'PESTAÑAS', 'Pestanas' => 'Pestañas', 'pestanas' => 'pestañas',
+            'ADEMAS' => 'ADEMÁS', 'Ademas' => 'Además', 'ademas' => 'además',
+            'COJIN' => 'COJÍN', 'Cojin' => 'Cojín', 'cojin' => 'cojín',
+            'CORDON' => 'CORDÓN', 'Cordon' => 'Cordón', 'cordon' => 'cordón',
+            'MATRICULA' => 'MATRÍCULA', 'Matricula' => 'Matrícula', 'matricula' => 'matrícula',
+            'SILICON' => 'SILICÓN', 'Silicon' => 'Silicón', 'silicon' => 'silicón',
+            'MEDITERRANEO' => 'MEDITERRÁNEO', 'Mediterraneo' => 'Mediterráneo', 'mediterraneo' => 'mediterráneo',
+            'anaden' => 'añaden', 'anade' => 'añade',
+            'distincion' => 'distinción',
+            'liston' => 'listón',
+            'companero' => 'compañero', 'companera' => 'compañera',
+            'portatil' => 'portátil',
+            'versatil' => 'versátil',
+            'opcion' => 'opción', 'Opcion' => 'Opción',
+            'combinacion' => 'combinación',
+            'porta-lapices' => 'porta-lápices',
+            'ceramica' => 'cerámica',
+            'termica' => 'térmica',
+            'portatil' => 'portátil',
+            'contemporaneo' => 'contemporáneo',
+            'humedas' => 'húmedas',
+            'carton' => 'cartón',
+            'circulacion' => 'circulación',
+            'musculos' => 'músculos',
+            'rigido' => 'rígido',
+            'sanguinea' => 'sanguínea',
+            'permitiendote' => 'permitiéndote',
+            'cronologica' => 'cronológica',
+            'aerodinamico' => 'aerodinámico',
+            'friccion' => 'fricción',
+            'ventilacion' => 'ventilación',
+        ];
+    }
+
+    protected function applyTextReplacements(?string $text): ?string
+    {
+        if ($text === null || $text === '') {
+            return $text;
+        }
+        $replacements = $this->getWordReplacements();
+        foreach ($replacements as $search => $replace) {
+            $text = preg_replace('/\b' . preg_quote($search, '/') . '\b/u', $replace, $text);
+        }
+        return $text;
+    }
+
+    public function run(array $params)
+    {
+        CLI::write('*** Iniciando Sincronización a Shopify ***', 'green');
+        $isDryRun = CLI::getOption('dry-run') ?? false;
+        $limit = CLI::getOption('limit');
+        if ($limit !== null && $limit !== false && (!is_numeric($limit) || (int)$limit <= 0)) {
+            CLI::error("La opción --limit ('{$limit}') debe ser un número entero positivo."); return EXIT_USER_INPUT;
+        }
+        $limit = ($limit !== null && $limit !== false) ? (int)$limit : null;
+        $offset = CLI::getOption('offset');
+        if ($offset !== null && $offset !== false && (!is_numeric($offset) || (int)$offset < 0)) {
+            CLI::error("La opción --offset ('{$offset}') debe ser un número entero no negativo."); return EXIT_USER_INPUT;
+        }
+        $offset = ($offset !== null && $offset !== false) ? (int)$offset : 0;
+        $skuToSync = CLI::getOption('sku');
+        if ($skuToSync === false) { $skuToSync = null; }
+        $isFullCli = CLI::getOption('full') ?? false;
+        $isStockOnlyCli = CLI::getOption('stock-only') ?? false;
+        $skipImageUpdates = CLI::getOption('skip-image-updates') ?? false;
+
+        if ($isDryRun) { CLI::write('--- MODO DRY RUN --- No se realizarán cambios reales en Shopify.', 'yellow'); }
+        else { CLI::write('--- MODO REAL --- Se realizarán cambios en Shopify.', 'light_red'); }
+        if ($skipImageUpdates) { CLI::write('--- AVISO: Se omitirán las actualizaciones de imágenes para productos existentes. ---', 'yellow');}
+
+        $mainOptionsCount = ($isFullCli ? 1 : 0) + ($isStockOnlyCli ? 1 : 0) + ($skuToSync !== null ? 1 : 0);
+        if ($mainOptionsCount > 1) {
+            CLI::error('Error: --full, --stock-only, y --sku son mutuamente excluyentes. Elija solo una operación principal.');
+            CLI::write($this->usage, 'yellow');
+            return EXIT_USER_INPUT;
+        }
+        
+        $locationId = $this->primaryShopifyLocationId;
+        
+        try {
+            if ($isStockOnlyCli) {
+                CLI::write('--- MODO STOCK ONLY ---', 'blue');
+                if (empty($locationId) && !$isDryRun) {
+                    CLI::error("Shopify Location ID no configurado, necesario para --stock-only en modo real.");
+                    return EXIT_CONFIG;
+                }
+                $this->runStockOnlySyncToShopify($isDryRun, $locationId);
+            } elseif ($skuToSync !== null) {
+                CLI::write("--- MODO SYNC PARA SKU ESPECÍFICO: {$skuToSync} ---", 'blue');
+                if ($limit) { CLI::write('Advertencia: --limit se ignora cuando se usa --sku.', 'yellow'); }
+                if ($offset > 0) { CLI::write('Advertencia: --offset se ignora con --sku.', 'yellow');}
+                $this->runFullProductSync($skuToSync, null, 0, true, $isDryRun, $locationId, $skipImageUpdates);
+            } elseif ($isFullCli) {
+                CLI::write('--- MODO FULL SYNC (COMPLETO DESDE BD) ---', 'blue');
+                if ($offset > 0) { CLI::write("--- Iniciando desde offset: {$offset} ---", 'yellow');}
+                $this->runFullProductSync(null, $limit, $offset, true, $isDryRun, $locationId, $skipImageUpdates);
+            } else {
+                CLI::write('--- MODO SYNC INCREMENTAL (productos activos BD por defecto) ---', 'blue');
+                if ($offset > 0) { CLI::write("--- Iniciando desde offset: {$offset} ---", 'yellow');}
+                $this->runFullProductSync(null, $limit, $offset, false, $isDryRun, $locationId, $skipImageUpdates);
+            }
+        } catch (\Throwable $e) {
+            CLI::error('*** ERROR INESPERADO DURANTE LA SINCRONIZACIÓN ***');
+            CLI::error('Mensaje: ' . $e->getMessage());
+            CLI::error('Archivo: ' . $e->getFile() . ' Línea: ' . $e->getLine());
+            $this->logger->critical("[ShopifySyncCommand][RUN_EXCEPTION] " . $e->getMessage() . "\n" . $e->getTraceAsString());
+            CLI::newLine(); CLI::error("Stack trace:\n" . $e->getTraceAsString());
+            CLI::newLine(); CLI::write('*** Sincronización Interrumpida ***', 'red');
+            return EXIT_ERROR;
+        }
+        CLI::write('*** Sincronización a Shopify Finalizada ***', 'green');
+        return EXIT_SUCCESS;
+    }
+
+    protected function runStockOnlySyncToShopify(bool $isDryRun, string $locationId): void
+    {
+        CLI::write('Obteniendo variantes con inventory_idshopify desde la BD local...', 'light_blue');
+        $variantsToUpdate = $this->variantModel
+            ->select('tb_variants.*, tb_parent.idshopify as parent_idshopify_check')
+            ->join('tb_parent', 'tb_parent.id = tb_variants.id_parent')
+            ->where('tb_variants.inventory_idshopify IS NOT NULL', null, false)
+            ->where('tb_variants.inventory_idshopify !=', '')
+            ->where('tb_parent.idshopify IS NOT NULL', null, false)
+            ->where('tb_parent.idshopify !=', '')
+            ->findAll();
+        if (empty($variantsToUpdate)) {
+            CLI::write('No se encontraron variantes con inventory_idshopify para actualizar stock.', 'yellow');
+            return;
+        }
+        CLI::write(count($variantsToUpdate) . ' variantes encontradas para actualizar stock en Shopify.', 'cyan');
+        $successCount = 0; $errorCount = 0; $processedCount = 0;
+        foreach ($variantsToUpdate as $variant) {
+            $processedCount++;
+            $localSku = $variant['sku'] ?? 'N/A';
+            $inventoryItemId = $variant['inventory_idshopify'];
+            $stockTotal = (int)($variant['stock_gdl'] ?? 0) + (int)($variant['stock_mty'] ?? 0) + (int)($variant['stock_edomex'] ?? 0);
+            CLI::write("  [{$processedCount}/" . count($variantsToUpdate) . "] SKU: {$localSku} (InvItemID: {$inventoryItemId}). Stock Local: {$stockTotal}", 'dark_gray');
+            if ($isDryRun) {
+                CLI::write("    [DRY RUN] Actualizaría stock a {$stockTotal} para InvItemID {$inventoryItemId} en LocID {$locationId}", "light_gray");
+                $successCount++;
+            } else {
+                if (empty($locationId)) {
+                     CLI::error("    ERROR CRÍTICO: Location ID está vacío en modo real para SKU {$localSku}. Saltando stock.");
+                     $this->logger->error("[shopify:sync][StockOnly] Location ID vacío para SKU {$localSku}, InvItemID {$inventoryItemId}");
+                     $errorCount++;
+                     continue;
+                }
+                $stockSetResult = $this->shopifyService->setInventoryLevel($inventoryItemId, $locationId, $stockTotal);
+                if ($stockSetResult) {
+                    CLI::write("    Stock para SKU {$localSku} actualizado a {$stockTotal} en Shopify.", 'green');
+                    $successCount++;
+                } else {
+                    CLI::error("    Fallo al actualizar stock para SKU {$localSku} (InvItemID {$inventoryItemId}). Revisa logs del servicio.");
+                    $this->logger->error("[shopify:sync][StockOnly] Fallo setInventoryLevel para SKU {$localSku}, InvItemID {$inventoryItemId}, Stock {$stockTotal}");
+                    $errorCount++;
+                }
+                usleep(600000);
+            }
+        }
+        CLI::newLine(); CLI::write("--- Resumen Sincronización de Stock Únicamente ---", 'green');
+        CLI::write("Variantes procesadas: " . $processedCount, 'cyan');
+        CLI::write("Stocks actualizados/simulados exitosamente: " . $successCount, 'green');
+        CLI::write("Errores al actualizar stock: " . $errorCount, $errorCount > 0 ? 'red' : 'green');
+    }
+
+    protected function runFullProductSync(?string $specificSkuParam, ?int $limit, int $offset, bool $isDbQueryExhaustive, bool $isDryRun, string $locationId, bool $skipImageUpdates): void
+    {
+        $this->logger->info("runFullProductSync: SKU: " . var_export($specificSkuParam, true) . ", Limit: {$limit}, Offset: {$offset}, Exhaustive: " . var_export($isDbQueryExhaustive, true) . ", SkipImgUpd: " . var_export($skipImageUpdates, true));
+        $productsToSync = $this->getProductsFromLocalDB($specificSkuParam, $limit, $offset, $isDbQueryExhaustive);
+        CLI::write(count($productsToSync) . ' productos padre encontrados para sincronización COMPLETA.', 'cyan');
+        if (empty($productsToSync)) {
+            CLI::write('No hay productos para la sincronización completa.', 'yellow');
+            return;
+        }
+        $overallSuccessCount = 0; $overallErrorCount = 0; $processedCount = 0;
+        foreach ($productsToSync as $parentProduct) {
+            $processedCount++; CLI::newLine();
+            CLI::write("[{$processedCount}/" . count($productsToSync) . "] Procesando Padre (Modo Completo): {$parentProduct['parent_code']} (ID Local: {$parentProduct['id']})", 'blue');
+            $localVariants = $this->variantModel->findByParentId($parentProduct['id']);
+            if (empty($localVariants)) {
+                CLI::write(" - ADVERTENCIA: Sin variantes para padre ID {$parentProduct['id']}. Saltando...", 'yellow');
+                $overallErrorCount++; continue;
+            }
+            CLI::write(" - Encontradas " . count($localVariants) . " variantes locales.", 'light_blue');
+            $shopifyProductData = $this->prepareShopifyData($parentProduct, $localVariants);
+            if (empty($shopifyProductData['title']) || empty($shopifyProductData['variants'])) {
+                CLI::error(" - ERROR: Datos inválidos preparados para SKU {$parentProduct['parent_code']}. Saltando...");
+                $this->logger->error("[shopify:sync][Full] Datos inválidos para padre ID {$parentProduct['id']}: " . json_encode($shopifyProductData));
+                $overallErrorCount++; continue;
+            }
+            if ($this->syncSingleProduct($parentProduct, $shopifyProductData, $isDryRun, $localVariants, $locationId, $skipImageUpdates)) {
+                $overallSuccessCount++;
+            } else {
+                $overallErrorCount++;
+                CLI::error(" - Error al sincronizar completamente el producto {$parentProduct['parent_code']}. Revisa logs.");
+            }
+            if (!$isDryRun) { usleep(700000); }
+        }
+        CLI::newLine(); CLI::write("--- Resumen Sincronización Completa de Productos ---", 'green');
+        CLI::write("Productos padre intentados: " . $processedCount, 'cyan');
+        CLI::write("Sincronizados/Simulados exitosamente: " . $overallSuccessCount, 'green');
+        CLI::write("Errores/Saltados: " . $overallErrorCount, $overallErrorCount > 0 ? 'red' : 'green');
+    }
+
+    protected function getProductsFromLocalDB(?string $specificSkuParam, ?int $limit, int $offset, bool $isDbQueryExhaustive): array
+    {
+        CLI::write('Obteniendo productos desde la base de datos local...', 'light_blue');
+        $this->logger->info("[getPFLDB] SKU: " . ($specificSkuParam ?? 'N/A') . ", Limit: " . ($limit ?? 'N/A') . ", Offset: {$offset}, Exhaustive: " . ($isDbQueryExhaustive ? 'Yes' : 'No'));
+        $results = [];
+        try {
+            $query = $this->parentModel;
+            if ($specificSkuParam !== null) {
+                CLI::write("Filtrando por SKU: {$specificSkuParam}", 'yellow');
+                $query->where('parent_code', $specificSkuParam);
+            }
+            elseif (!$isDbQueryExhaustive) {
+                if (in_array('active', $this->parentModel->allowedFields ?? [])) {
+                    $query->where('active', 1);
+                    CLI::write('Filtrando por productos activos localmente (active=1).', 'yellow');
+                } else {
+                    CLI::write('Campo "active" no definido en ParentProductModel (no se filtra por activo por defecto para incremental).', 'light_red');
+                }
+            } else {
+                 CLI::write('Query a BD es exhaustiva (no se aplica filtro "active" adicional).', 'yellow');
+            }
+
+            if ($offset > 0 && $specificSkuParam === null) { 
+                $query->offset($offset);
+                CLI::write("Aplicando offset: {$offset}", 'yellow');
+            }
+            if ($limit !== null && $specificSkuParam === null) {  
+                CLI::write("Limitando a {$limit} productos.", 'yellow');
+                $query->limit($limit);
+            }
+            
+            $query->orderBy('id', 'ASC');
+            $results = $query->findAll();
+            $this->logger->info('[getPFLDB] Tipo de $results después de findAll(): ' . gettype($results));
+            if ($results === null) {
+                CLI::write('[getPFLDB] findAll() devolvió NULL. Convirtiendo a array vacío.', 'yellow');
+                $this->logger->warning('[getPFLDB] findAll() devolvió NULL.');
+                $results = [];
+            } elseif (!is_array($results)) {
+                CLI::write('[getPFLDB] findAll() NO devolvió un array ni NULL. Tipo: ' . gettype($results) . '. Convirtiendo.', 'red');
+                $this->logger->error('[getPFLDB] findAll() NO devolvió array/NULL. Tipo: ' . gettype($results) . '. Valor: ' . print_r($results, true));
+                $results = [];
+            }
+            $count = count($results);
+            CLI::write("[getPFLDB] Encontró {$count} productos.", 'light_blue');
+            $this->logger->info("[getPFLDB] Encontró {$count} productos.");
+            return $results;
+        } catch (\Throwable $e) {
+            CLI::error("[getPFLDB] EXCEPCIÓN INTERNA: " . $e->getMessage());
+            $this->logger->error("[getPFLDB] EXCEPCIÓN INTERNA: " . $e->getMessage() . " en " . $e->getFile() . ":" . $e->getLine() . "\n" . $e->getTraceAsString());
+            return [];
+        }
+    }
+    
+    protected function prepareShopifyData(array $parentProduct, array $localVariants): array
+    {
+         CLI::write(" - [PDP] Iniciando prepareShopifyData para SKU {$parentProduct['parent_code']}", 'dark_gray');
+         
+         $processedImageUrlsForPayload = []; // <--- AÑADE ESTA LÍNEA AQUÍ
+
+         $rawTitle = $parentProduct['title'] ?? 'Sin Título';
+         $title = $this->applyTextReplacements($rawTitle);
+         $generatedHandle = $this->generateShopifyHandle($title);
+         $this->logger->info("[prepareShopifyData] SKU {$parentProduct['parent_code']}: Título original '{$rawTitle}', Título procesado '{$title}', Handle generado '{$generatedHandle}'");
+         $body_html = $this->applyTextReplacements($parentProduct['description'] ?? '');
+         $product_type = $this->applyTextReplacements($parentProduct['category_name'] ?? 'Sin Categoría');
+         $tags = $this->applyTextReplacements($parentProduct['tags'] ?? '');
+         $optionNames = []; $hasColor = false; $hasSize = false;
+         CLI::write(" - [PDP] Procesando detección de opciones...", 'dark_gray');
+         foreach ($localVariants as $idx => $variant) {
+              $variantColorName = $this->applyTextReplacements($variant['color_name'] ?? '');
+              $variantTalla = $this->applyTextReplacements($variant['talla'] ?? '');    
+              CLI::write("   - [PDP] Variante local #{$idx} SKU: " . ($variant['sku'] ?? 'SIN_SKU') . " Color: '" . $variantColorName . "' Talla: '" . $variantTalla . "'", 'dark_gray');
+              if (!$hasColor && !empty($variantColorName)) { $hasColor = true; $optionNames[] = 'Color'; }
+              if (!$hasSize && !empty($variantTalla)) { $hasSize = true; }
+         }
+         if ($hasSize && !in_array('Talla', $optionNames)) { $optionNames[] = 'Talla'; }
+         if (empty($optionNames)) { $optionNames[] = 'Title'; }
+         CLI::write(" - [PDP] Nombres de Opciones detectados: " . implode(', ', $optionNames), 'dark_gray');
+         $shopifyOptions = [];
+         foreach ($optionNames as $name) {
+             $shopifyOptions[] = ['name' => $this->applyTextReplacements($name)];
+         }
+         $status = 'active';
+         if (isset($parentProduct['active']) && in_array('active', $this->parentModel->allowedFields ?? []) && (int)$parentProduct['active'] === 0) {
+            $status = 'draft';
+         } elseif (isset($parentProduct['active']) && in_array('active', $this->parentModel->allowedFields ?? []) && (int)$parentProduct['active'] === 1) {
+            $status = 'active';
+         } else {
+             $this->logger->info("[prepareShopifyData] 'active' no definido o valor no es 1 para SKU {$parentProduct['parent_code']}. Usando status: '{$status}'.");
+         }
+         CLI::write(" - [PDP] Status del producto: {$status}", 'dark_gray');
+         $shopifyData = [
+             'title'        => $title,
+             'handle'       => $generatedHandle,
+             'body_html'    => $body_html,
+             'vendor'       => 'Promoopción',
+             'product_type' => $product_type,
+             'status'       => $status,
+             'tags'         => $tags,
+             'options'      => $shopifyOptions,
+             'variants'     => [],
+             'images'       => [],   
+         ];
+         CLI::write(" - [PDP] Datos base de ShopifyData creados. Título: '{$shopifyData['title']}', Handle: '{$shopifyData['handle']}'", 'dark_gray');
+         $processedImageUrls = [];
+         $notFoundImageUrl = "https://www.contenidopromo.com/Images/Items/notFound.jpg";
+        if (!empty($parentProduct['image_parent']) && trim($parentProduct['image_parent']) !== $notFoundImageUrl) { 
+    $rawImageUrl = trim($parentProduct['image_parent']);
+    $encodedImageUrl = str_replace(' ', '%20', $rawImageUrl); // CODIFICAR ESPACIOS
+    if (!in_array($encodedImageUrl, $processedImageUrlsForPayload)) { 
+        $shopifyData['images'][] = ['src' => $encodedImageUrl, 'alt' => $this->applyTextReplacements($title . ' - Imagen Principal')]; 
+        $processedImageUrlsForPayload[] = $encodedImageUrl; 
+            }
+        }
+        CLI::write(" - [PDP] Procesando imágenes de variantes (para galería)...", 'dark_gray');
+foreach ($localVariants as $variant) {
+    for ($imgIndex = 0; $imgIndex <= 9; $imgIndex++) { 
+        $imgField = ($imgIndex === 0) ? 'image' : 'image_' . $imgIndex; 
+        if ($imgIndex === 1 && !array_key_exists('image_1', $variant) && !in_array('image_1_idshopify', $this->variantModel->allowedFields ?? [])) continue;
+        
+        if (!empty($variant[$imgField]) && trim($variant[$imgField]) !== $notFoundImageUrl) { 
+            $rawImageUrl = trim($variant[$imgField]); 
+            $encodedImageUrl = str_replace(' ', '%20', $rawImageUrl); // CODIFICAR ESPACIOS
+            if (!in_array($encodedImageUrl, $processedImageUrlsForPayload)) { 
+                $variantColorNameForAlt = $this->applyTextReplacements($variant['color_name'] ?? '');
+                $variantTallaForAlt = $this->applyTextReplacements($variant['talla'] ?? '');
+                $altForVariantImage = trim($title . " - " . $variantColorNameForAlt . " " . $variantTallaForAlt . " - img " . ($imgIndex + 1), " - ");
+                $shopifyData['images'][] = ['src' => $encodedImageUrl, 'alt' => $altForVariantImage]; 
+                $processedImageUrlsForPayload[] = $encodedImageUrl; 
+                    }
+                }
+            }
+        }
+        if (!empty($parentProduct['image_vector']) && trim($parentProduct['image_vector']) !== $notFoundImageUrl) { 
+    $rawImageUrl = trim($parentProduct['image_vector']);
+    $encodedImageUrl = str_replace(' ', '%20', $rawImageUrl); // CODIFICAR ESPACIOS
+    if (!in_array($encodedImageUrl, $processedImageUrlsForPayload)) { 
+        $shopifyData['images'][] = ['src' => $encodedImageUrl, 'alt' => $this->applyTextReplacements($title . ' - Imagen Vectorial')]; 
+        $processedImageUrlsForPayload[] = $encodedImageUrl; 
+            }
+        }
+         CLI::write(" - [PDP] Total imágenes únicas preparadas: " . count($shopifyData['images']), 'dark_gray');
+         CLI::write(" - [PDP] Iniciando bucle de variantes para mapeo de datos...", 'dark_gray');
+         foreach ($localVariants as $idx => $variant) {
+             $priceBase = $variant['price'] ?? null; $priceType = $variant['tipo'] ?? null;
+             $calculatedPrice = $this->calculateFinalPrice($priceBase, $priceType);
+             $shopifyVariant = [
+                 'price' => $calculatedPrice, 'sku' => $variant['sku'] ?? '',
+                 'inventory_management' => 'shopify', 'weight' => $variant['weight'] ?? 0,
+                 'weight_unit' => 'kg', 'barcode' => $variant['barcode'] ?? null,
+             ];
+             $optionIndex = 1;
+             if (in_array('Color', $optionNames)) {
+                 $shopifyVariant['option' . $optionIndex++] = $this->applyTextReplacements($variant['color_name'] ?? '-');
+             }
+             if (in_array('Talla', $optionNames)) {
+                 $shopifyVariant['option' . $optionIndex++] = $this->applyTextReplacements($variant['talla'] ?? '-');
+             }
+             if (!isset($shopifyVariant['option1']) && ($optionNames[0] ?? '') === 'Title') { $shopifyVariant['option1'] = 'Default Title'; }
+             $shopifyData['variants'][] = array_filter($shopifyVariant, fn($value) => $value !== null && ($value !== '' || is_numeric($value)));
+         }
+         CLI::write(" - [PDP] Bucle de variantes completado. Total variantes Shopify: " . count($shopifyData['variants']), 'dark_gray');
+         if (empty($shopifyData['variants'])) { $this->logger->warning("[prepareShopifyData] Sin variantes para padre ID {$parentProduct['id']}! Creando default."); $shopifyData['options'] = [['name' => 'Title']]; $shopifyData['variants'][] = [ 'option1' => 'Default Title', 'price' => $this->calculateFinalPrice(0, 'NORMAL'), 'sku' => $parentProduct['parent_code'] . '-DEFAULT' ]; }
+         $this->logger->debug('[prepareShopifyData] Datos finales antes de metacampos: ' . json_encode($shopifyData));
+         CLI::write("   [DEBUG PDP] Título final: " . ($shopifyData['title'] ?? 'VACIO'), 'light_gray');
+         CLI::write("   [DEBUG PDP] Handle final: " . ($shopifyData['handle'] ?? 'VACIO'), 'light_gray');
+         CLI::write("   [DEBUG PDP] Body HTML: " . (isset($shopifyData['body_html']) ? strlen($shopifyData['body_html']).' chars' : 'AUSENTE o VACIO'), 'light_gray');
+         CLI::write("   [DEBUG PDP] #Variantes finales: " . (count($shopifyData['variants'] ?? [])), 'light_gray');
+         CLI::write("   [DEBUG PDP] #Imágenes finales: " . (count($shopifyData['images'] ?? [])), 'light_gray');
+        $shopifyData['metafields'] = [];
+        $metafieldMappings = [
+            'box_count' => 'empaque_piezas', 'box_weight' => 'empaque_peso',
+            'print_area' => 'impresion_area', 'print_tech' => 'impresion_tecnica',
+            'product_size' => 'producto_medida', 'capacity' => 'producto_capacidad',
+            'material' => 'producto_material', 'box_individual' => 'empaque_individual',
+            'box_size' => 'empaque_medida',
+        ];
+        $metafieldNamespace = 'custom'; $metafieldType = 'single_line_text_field';
+        foreach ($metafieldMappings as $localKey => $shopifyKey) {
+            if (isset($parentProduct[$localKey])) {
+                $originalValue = $parentProduct[$localKey]; $processedValue = trim((string)$originalValue);
+                if ($localKey === 'box_size' && $shopifyKey === 'empaque_medida' && $processedValue !== '') {
+                    $dimensions_m_str = explode('x', $processedValue);
+                    if (count($dimensions_m_str) === 3) {
+                        $l_cm = round((float)trim($dimensions_m_str[0]) * 100); $w_cm = round((float)trim($dimensions_m_str[1]) * 100); $h_cm = round((float)trim($dimensions_m_str[2]) * 100);
+                        $processedValue = "{$l_cm} x {$w_cm} x {$h_cm} cm";
+                        $this->logger->info("[prepareShopifyData] SKU {$parentProduct['parent_code']}: box_size '{$originalValue}' (m) convertido a '{$processedValue}' (cm) para '{$shopifyKey}'.");
+                    } else { $this->logger->warning("[prepareShopifyData] SKU {$parentProduct['parent_code']}: Formato de box_size ('{$originalValue}') no esperado. Usando original para '{$shopifyKey}'.");}
+                } elseif ($localKey === 'box_individual' && $shopifyKey === 'empaque_individual') {
+                    $processedValue = ((int)$originalValue === 1) ? 'Sí' : 'No';
+                } else { $processedValue = $this->applyTextReplacements($processedValue); }
+                if ($processedValue !== '' || ($localKey === 'box_individual' && $shopifyKey === 'empaque_individual') ) {
+                    $shopifyData['metafields'][] = [
+                        'namespace' => $metafieldNamespace, 'key' => $shopifyKey,
+                        'value' => $processedValue, 'type' => $metafieldType, ];
+                }
+            }
+        }
+        if (!empty($shopifyData['metafields'])) {
+            $this->logger->debug("[prepareShopifyData] Metacampos preparados para SKU {$parentProduct['parent_code']}: " . json_encode($shopifyData['metafields']));
+            CLI::write("   - [PDP] Metacampos preparados: " . count($shopifyData['metafields']), 'dark_gray');
+        } else { CLI::write("   - [PDP] No se prepararon metacampos para SKU {$parentProduct['parent_code']}", 'dark_gray');}
+        CLI::write(" - [PDP] Fin prepareShopifyData (con metacampos).", 'dark_gray');
+        return $shopifyData;
+    }
+    
+    protected function syncSingleProduct(array $parentProduct, array $shopifyData, bool $isDryRun, array $localVariants, string $locationId, bool $skipImageUpdates): bool
+    {
+        $this->logger->critical("DEBUG_SSP_START: Iniciando syncSingleProduct para SKU {$parentProduct['parent_code']}. DryRun: " . ($isDryRun?'Y':'N') . ". SkipImgUpd: " . ($skipImageUpdates?'Y':'N'));
+
+        $shopifyProductId = $parentProduct['idshopify'] ?? null;
+        $productIdLocal = $parentProduct['id'];
+        $productSku = $parentProduct['parent_code'];
+        $existingShopifyProduct = null; 
+
+        if ($shopifyProductId) {
+            CLI::write(" - Verificando Shopify ID local: {$shopifyProductId} para SKU {$productSku}...", 'light_blue');
+            $existingShopifyProduct = $this->shopifyService->getProductById($shopifyProductId);
+            if ($existingShopifyProduct) {
+                CLI::write(" - Producto encontrado en Shopify por ID local. Procederá a actualizar.", 'yellow');
+            } else {
+                CLI::write(" - ADV: Producto NO encontrado en Shopify con ID local {$shopifyProductId}. Se intentará buscar por handle antes de crear.", 'yellow');
+                $this->logger->warning("[syncSingleProduct] Producto con SKU {$productSku} tenía idshopify local '{$parentProduct['idshopify']}' pero no se encontró en Shopify. Buscando por handle.");
+                $shopifyProductId = null; 
+            }
+        }
+        
+        if ($shopifyProductId === null) { 
+            $originalIdshopifyForLog = $parentProduct['idshopify'] ?? 'NINGUNO';
+            CLI::write(" - Buscando/Creando para SKU {$productSku}. (ID Shopify local era: {$originalIdshopifyForLog})", 'cyan');
+            $generatedHandle = $shopifyData['handle'] ?? $this->generateShopifyHandle($shopifyData['title']);
+            CLI::write("   Buscando producto existente en Shopify por handle: '{$generatedHandle}'...", 'light_blue');
+            $this->logger->info("[syncSingleProduct] Buscando por handle '{$generatedHandle}' para SKU {$productSku}.");
+            $productsFoundByHandle = $this->shopifyService->getProductsByHandle($generatedHandle);
+
+            if ($productsFoundByHandle !== null && !empty($productsFoundByHandle)) {
+                $existingShopifyProduct = $productsFoundByHandle[0]; 
+                $shopifyProductId = $existingShopifyProduct['id'];
+                CLI::write("   PRODUCTO EXISTENTE ENCONTRADO por handle '{$generatedHandle}'. Shopify ID: {$shopifyProductId}. Se procederá a ACTUALIZAR.", 'yellow');
+                $this->logger->info("[syncSingleProduct] Producto existente (ID: {$shopifyProductId}) encontrado por handle '{$generatedHandle}' para SKU {$productSku}. Se actualizará.");
+                if (!$isDryRun) {
+                    if (($parentProduct['idshopify'] ?? null) != $shopifyProductId) {
+                        $this->parentModel->update($productIdLocal, ['idshopify' => $shopifyProductId]);
+                        CLI::write("   ID Shopify {$shopifyProductId} (encontrado por handle) guardado/actualizado en BD local para SKU {$productSku}.", 'light_blue');
+                    }
+                } else {
+                    CLI::write("   [DRY RUN] Se guardaría/actualizaría ID Shopify {$shopifyProductId} (encontrado por handle) en BD local para SKU {$productSku}.", 'light_gray');
+                }
+            } else {
+                CLI::write("   No se encontró producto existente por handle '{$generatedHandle}'. Se creará como nuevo.", 'cyan');
+                $this->logger->info("[syncSingleProduct] No se encontró producto por handle '{$generatedHandle}' para SKU {$productSku}. Se creará nuevo.");
+                $existingShopifyProduct = null; 
+            }
+        }
+
+        // --- FLUJO DE ACTUALIZACIÓN ---
+        if ($existingShopifyProduct) {
+            // (Código del flujo de ACTUALIZACIÓN de v41.5 - con la corrección de str_replace para uploadProductImage)
+            // ... (este bloque es largo, me centraré en asegurar que la parte de subida de imagen esté corregida)
+            $shopifyProductId = $existingShopifyProduct['id']; 
+            CLI::write(" - Iniciando Actualización del producto en Shopify ID: {$shopifyProductId} (SKU Local: {$productSku})", 'cyan');
+            
+            $updateDataParent = [
+                'id' => $shopifyProductId, 
+                'title' => $shopifyData['title'], 
+                'body_html' => $shopifyData['body_html'],
+                'vendor' => $shopifyData['vendor'], 
+                'product_type' => $shopifyData['product_type'],
+                'status' => $shopifyData['status'], 
+                'tags' => $shopifyData['tags'],
+            ];
+            if (isset($shopifyData['metafields']) && !empty($shopifyData['metafields'])) {
+                $updateDataParent['metafields'] = $shopifyData['metafields'];
+            }
+
+            $parentUpdateSuccess = false; // Mover la inicialización aquí
+            if ($isDryRun) {
+                CLI::write("   [DRY RUN] Se actualizaría Padre ID {$shopifyProductId} ({$productSku})", 'light_gray');
+                $this->logger->debug("[DRY_RUN][UpdateProduct] Payload: " . json_encode($updateDataParent, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE));
+                $parentUpdateSuccess = true;
+            } else {
+                $this->logger->critical("DEBUG_SSP_BEFORE_UPDATE_PRODUCT: SKU {$productSku}, Payload: " . json_encode($updateDataParent, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE));
+                $updatedShopifyProductResponse = $this->shopifyService->updateProduct($shopifyProductId, $updateDataParent);
+                $this->logger->critical("DEBUG_SSP_AFTER_UPDATE_PRODUCT: SKU {$productSku}, Response: " . json_encode($updatedShopifyProductResponse, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE));
+                if ($updatedShopifyProductResponse) {
+                    CLI::write("   Padre ID {$shopifyProductId} actualizado.", 'green');
+                    $existingShopifyProduct = $updatedShopifyProductResponse; 
+                    $parentUpdateSuccess = true;
+                } else {
+                    CLI::error("   Fallo actualizar padre ID {$shopifyProductId}.");
+                    $this->logger->error("[syncSingleProduct][Update] Fallo updateProduct para Shopify ID {$shopifyProductId}, SKU {$productSku}");
+                    return false;
+                }
+            }
+
+            if (!$parentUpdateSuccess && !$isDryRun) return false;
+
+            if (!$skipImageUpdates) {
+                CLI::write("   - Verificando/Subiendo imágenes del padre para producto ID {$shopifyProductId}...", 'light_blue');
+                $this->logger->critical("DEBUG_SSP_BEFORE_PARENT_IMAGES_UPDATE: SKU {$productSku}");
+                $currentParentDataForImages = $this->parentModel->find($productIdLocal);
+                if ($currentParentDataForImages) {
+                    $this->uploadAndSaveParentImages($currentParentDataForImages, $shopifyProductId, $isDryRun);
+                }
+                $this->logger->critical("DEBUG_SSP_AFTER_PARENT_IMAGES_UPDATE: SKU {$productSku}");
+                
+                if(!$isDryRun) { 
+                    $freshProductData = $this->shopifyService->getProductById($shopifyProductId);
+                    if ($freshProductData) {
+                        $existingShopifyProduct = $freshProductData; 
+                        CLI::write("   - Datos del producto Shopify ID {$shopifyProductId} refrescados después de imágenes padre.", 'dark_gray');
+                        $this->logger->critical("DEBUG_SSP_PRODUCT_REFRESHED_AFTER_PARENT_IMG_UPDATE: SKU {$productSku}");
+                    }
+                }
+            } else {
+                 CLI::write("   - OMITIENDO procesamiento de imágenes del padre debido a --skip-image-updates.", 'cyan');
+            }
+
+            $productImagesShopify = $existingShopifyProduct['images'] ?? [];
+            $shopifyVariantsInShop = $existingShopifyProduct['variants'] ?? [];
+            
+            CLI::write("   - Sincronizando variantes para producto ID {$shopifyProductId}. Imágenes en producto: " . count($productImagesShopify), 'light_blue');
+            $this->logger->critical("DEBUG_SSP_SYNC_VARIANTS_START_UPDATE: SKU {$productSku}, Count localVariants: " . count($localVariants));
+
+            $shopifySkuToVariantMap = []; foreach ($shopifyVariantsInShop as $sv) { if (!empty($sv['sku'])) $shopifySkuToVariantMap[trim($sv['sku'])] = $sv; }
+            $variantErrorCountInternal = 0;
+
+            foreach ($localVariants as $lv) {
+                $localSku = trim($lv['sku'] ?? '');
+                if (empty($localSku)) { CLI::write("     - ADV: Variante local ID {$lv['id']} sin SKU. Saltando.", 'yellow'); $variantErrorCountInternal++; continue; }
+
+                $preparedVariantDataForShopify = null;
+                foreach ($shopifyData['variants'] as $pv) { if (($pv['sku'] ?? '') === $localSku) { $preparedVariantDataForShopify = $pv; break; } }
+                if (!$preparedVariantDataForShopify) { CLI::error("     - ERR: No hay datos preparados para la variante local SKU {$localSku}. Saltando."); $this->logger->error("[syncSingleProduct][Update] No prepared data for local variant SKU {$localSku}, Parent SKU {$productSku}"); $variantErrorCountInternal++; continue; }
+
+                $shopifyImageIdToAssign = null; 
+                $dbImageIdToSaveForVariant = $lv['image_idshopify'] ?? null; 
+                
+                $localMainImageUrl = trim($lv['image'] ?? '');
+                $notFoundImageUrl = "https://www.contenidopromo.com/Images/Items/notFound.jpg";
+
+                if (!$skipImageUpdates && !empty($localMainImageUrl) && $localMainImageUrl !== $notFoundImageUrl) {
+                    $this->logger->critical("DEBUG_SSP_VARIANT_IMG_PROC_START_UPDATE: SKU {$localSku}");
+                    if (!empty($dbImageIdToSaveForVariant)) {
+                        $foundInProductImages = false;
+                        foreach ($productImagesShopify as $sImg) {
+                            if (($sImg['id'] ?? null) == $dbImageIdToSaveForVariant) {
+                                $shopifyImageIdToAssign = $dbImageIdToSaveForVariant; $foundInProductImages = true;
+                                CLI::write("       - SKU {$localSku}: Usando image_idshopify local ({$dbImageIdToSaveForVariant}) válido en galería.", 'dark_gray');
+                                $this->logger->info("[syncSingleProduct][Update][Img] Using local image_idshopify {$dbImageIdToSaveForVariant} for SKU {$localSku} as it's valid in gallery.");
+                                break;
+                            }
+                        }
+                        if (!$foundInProductImages) { CLI::write("       - SKU {$localSku}: image_idshopify local ({$dbImageIdToSaveForVariant}) NO en galería. Buscando.", 'yellow'); $this->logger->warning("[syncSingleProduct][Update][Img] Local image_idshopify {$dbImageIdToSaveForVariant} for SKU {$localSku} NOT in gallery. Will search.");}
+                    }
+
+                    // Intento 1: Buscar por Alt Text exacto (prioridad)
+                    if (empty($shopifyImageIdToAssign)) {
+                        $expectedAltForMainVariant = trim(preg_replace('/\s+/', ' ', $this->applyTextReplacements( ($shopifyData['title'] ?? $productSku) . " - " . ($lv['color_name'] ? $this->applyTextReplacements($lv['color_name']) . " " : '') . ($lv['talla'] ? $this->applyTextReplacements($lv['talla']) . " " : '') . "- img 1" )));
+                        $this->logger->debug("[V_IMG_MAP_UPDATE_DEBUG] SKU {$localSku}: Attempting find by EXACT Alt. Expected: '{$expectedAltForMainVariant}'");
+                        foreach($productImagesShopify as $sImg) {
+                            $shopifyImgAltTrimmed = isset($sImg['alt']) ? trim(preg_replace('/\s+/', ' ', $sImg['alt'])) : null;
+                            if (!empty($shopifyImgAltTrimmed) && $shopifyImgAltTrimmed === $expectedAltForMainVariant) {
+                                $shopifyImageIdToAssign = $sImg['id']; 
+                                $dbImageIdToSaveForVariant = $sImg['id']; 
+                                CLI::write("       - SKU {$localSku}: IMAGEN ENCONTRADA EN GALERÍA (Exact Alt Text). Usando ImageID: {$shopifyImageIdToAssign}, ShopifyURL: {$sImg['src']}.", 'green');
+                                $this->logger->info("[syncSingleProduct][Update][Img] Variant image for SKU {$localSku} FOUND in gallery by Exact Alt Text. ShopifyID: {$sImg['id']}");
+                                break;
+                            }
+                        }
+                    }
+
+                    // Intento 2: Buscar por nombre normalizado si no se encontró por Alt Text
+                    if (empty($shopifyImageIdToAssign)) {
+                        $rawLocalFilename = basename(strtok($localMainImageUrl, '?'));
+                        $localNameNormalized = str_replace(' ', '_', pathinfo($rawLocalFilename, PATHINFO_FILENAME));
+                        CLI::write("       - SKU {$localSku}: No encontrada por Alt. Buscando por nombre normalizado local: '{$localNameNormalized}'", 'light_cyan');
+                        $this->logger->debug("[syncSingleProduct][Update][Img] Not found by Alt. Seeking by NormalizedLocalName: '{$localNameNormalized}' for SKU {$localSku}");
+                        
+                        foreach ($productImagesShopify as $sImg) {
+                            if (isset($sImg['src']) && isset($sImg['id'])) {
+                                $rawShopifyFilename = basename(strtok($sImg['src'], '?'));
+                                $shopifyNameNormalized = str_replace(' ', '_', pathinfo($rawShopifyFilename, PATHINFO_FILENAME));
+                                $shopifyNameNormalized = preg_replace('/_[a-f0-9]{8,}(-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i', '', $shopifyNameNormalized);
+                                $shopifyNameNormalized = preg_replace('/_[a-f0-9]{8,}$/i', '', $shopifyNameNormalized);
+
+                                $this->logger->debug("[V_IMG_MAP_UPDATE_DEBUG] SKU {$localSku}: Comparing NormLocal: '{$localNameNormalized}' with NormShopify: '{$shopifyNameNormalized}' (OriginalShopifyFile: '{$rawShopifyFilename}')");
+                                if (!empty($localNameNormalized) && stripos($shopifyNameNormalized, $localNameNormalized) === 0) {
+                                    $shopifyImageIdToAssign = $sImg['id']; 
+                                    $dbImageIdToSaveForVariant = $sImg['id']; 
+                                    CLI::write("       - SKU {$localSku}: IMAGEN ENCONTRADA EN GALERÍA (Normalized Name). Usando ImageID: {$shopifyImageIdToAssign}, ShopifyURL: {$sImg['src']}.", 'green');
+                                    $this->logger->info("[syncSingleProduct][Update][Img] Variant image for SKU {$localSku} FOUND in gallery by Normalized Name. ShopifyID: {$sImg['id']}");
+                                    break;
+                                }
+                            }
+                        }
+                        if (empty($shopifyImageIdToAssign)) { CLI::write("       - SKU {$localSku}: Imagen NO encontrada en galería por Nombres Normalizados. URL local: '{$localMainImageUrl}'.", 'yellow'); $this->logger->warning("[syncSingleProduct][Update][Img] Variant image for SKU {$localSku} NOT found by Normalized Names.");}
+                    }
+                    
+                    if (empty($shopifyImageIdToAssign) && !$isDryRun) {
+                        CLI::write("       - SKU {$localSku}: Imagen (URL: {$localMainImageUrl}) NO encontrada en galería. Subiendo...", 'yellow');
+                        $altTextForUpload = trim(preg_replace('/\s+/', ' ', $this->applyTextReplacements( ($shopifyData['title'] ?? $productSku) . " - " . ($lv['color_name'] ? $this->applyTextReplacements($lv['color_name']) . " " : '') . ($lv['talla'] ? $this->applyTextReplacements($lv['talla']) . " " : '') . "- img 1" )));
+                        
+                        $encodedLocalMainImageUrl = str_replace(' ', '%20', $localMainImageUrl);
+                        $this->logger->debug("[syncSingleProduct][Update][Img] Attempting to upload. Original URL: '{$localMainImageUrl}', Encoded URL for upload: '{$encodedLocalMainImageUrl}'");
+
+                        $newImage = $this->shopifyService->uploadProductImage($shopifyProductId, $encodedLocalMainImageUrl, $altTextForUpload);
+                        if ($newImage && isset($newImage['id'])) {
+                            $shopifyImageIdToAssign = $newImage['id']; $dbImageIdToSaveForVariant = $newImage['id'];
+                            $productImagesShopify[] = $newImage; 
+                            CLI::write("       - SKU {$localSku}: Imagen subida. Nuevo ImageID: {$shopifyImageIdToAssign}.", 'green');
+                            $this->logger->info("[syncSingleProduct][Update][Img] Variant image for SKU {$localSku} UPLOADED. New ShopifyID: {$shopifyImageIdToAssign}");
+                        } else { CLI::write("       - SKU {$localSku}: Fallo al subir imagen.", 'red'); $this->logger->error("[syncSingleProduct][Update][Img] Failed to upload variant image for SKU {$localSku}. URL: {$localMainImageUrl}"); $shopifyImageIdToAssign = null;}
+                    } elseif (empty($shopifyImageIdToAssign) && $isDryRun) { CLI::write("       - [DRY RUN] SKU {$localSku}: Imagen (URL: {$localMainImageUrl}) no en galería. Se subiría.", 'light_gray');}
+                    
+                    $this->logger->critical("DEBUG_SSP_VARIANT_IMG_PROC_END_UPDATE: SKU {$localSku}. ImageToAssign: " . var_export($shopifyImageIdToAssign, true));
+                
+                } elseif ($skipImageUpdates) {
+                    $currentShopifyVariantImageId = $shopifySkuToVariantMap[$localSku]['image_id'] ?? null;
+                    CLI::write("       - SKU {$localSku}: --skip-image-updates activo. Se mantendrá imagen existente de Shopify ID: " . ($currentShopifyVariantImageId ?? 'Ninguna Asignada en Shopify'), 'cyan');
+                    $shopifyImageIdToAssign = $currentShopifyVariantImageId; 
+                    $dbImageIdToSaveForVariant = $lv['image_idshopify'] ?? $currentShopifyVariantImageId; 
+                } else {
+                     $existingVariantDataInShopifyForImage = $shopifySkuToVariantMap[$localSku] ?? null;
+                     if ($existingVariantDataInShopifyForImage && !empty($existingVariantDataInShopifyForImage['image_id'])) {
+                         $shopifyImageIdToAssign = $existingVariantDataInShopifyForImage['image_id'];
+                         CLI::write("       - SKU {$localSku}: Sin imagen local válida. Conservando imagen Shopify ID: {$shopifyImageIdToAssign}", 'dark_gray');
+                     } else { CLI::write("       - SKU {$localSku}: Sin imagen local y sin imagen asociada en Shopify.", 'dark_gray'); }
+                     $dbImageIdToSaveForVariant = $shopifyImageIdToAssign;
+                }
+                
+                $variantShopifyIdToUseInAPI = null; 
+
+                if (isset($shopifySkuToVariantMap[$localSku])) {
+                    $existingVariantInShopifyData = $shopifySkuToVariantMap[$localSku];
+                    $variantShopifyId = $existingVariantInShopifyData['id']; 
+                    $variantShopifyIdToUseInAPI = $variantShopifyId;
+                    $inventoryItemId = $existingVariantInShopifyData['inventory_item_id'] ?? ($lv['inventory_idshopify'] ?? null);
+                    CLI::write("     - Variante SKU {$localSku} (ShopifyID:{$variantShopifyId}) encontrada. Actualizando...", 'cyan');
+                    
+                    $variantUpdatePayload = ['id' => $variantShopifyId];
+                    if (($preparedVariantDataForShopify['price'] ?? null) != ($existingVariantInShopifyData['price'] ?? null)) $variantUpdatePayload['price'] = $preparedVariantDataForShopify['price'];
+                    if (!empty($preparedVariantDataForShopify['sku']) && ($preparedVariantDataForShopify['sku'] != ($existingVariantInShopifyData['sku'] ?? null))) $variantUpdatePayload['sku'] = $preparedVariantDataForShopify['sku'];
+                    if (isset($preparedVariantDataForShopify['weight']) && ($preparedVariantDataForShopify['weight'] != ($existingVariantInShopifyData['weight'] ?? 0))) $variantUpdatePayload['weight'] = $preparedVariantDataForShopify['weight'] ?? 0;
+                    if (isset($preparedVariantDataForShopify['barcode']) && ($preparedVariantDataForShopify['barcode'] != ($existingVariantInShopifyData['barcode'] ?? null))) $variantUpdatePayload['barcode'] = $preparedVariantDataForShopify['barcode'] ?? null;
+                    
+                    for ($i = 1; $i <= 3; $i++) {
+                        $optKey = 'option' . $i;
+                        if (isset($preparedVariantDataForShopify[$optKey]) && ($preparedVariantDataForShopify[$optKey] != ($existingVariantInShopifyData[$optKey] ?? null) ) ) {
+                            $variantUpdatePayload[$optKey] = $preparedVariantDataForShopify[$optKey];
+                        }
+                    }
+
+                    if (!$skipImageUpdates) { 
+                        if ($shopifyImageIdToAssign && ($existingVariantInShopifyData['image_id'] ?? null) != $shopifyImageIdToAssign) {
+                            $variantUpdatePayload['image_id'] = $shopifyImageIdToAssign;
+                        }
+                    }
+                    
+                    if (count($variantUpdatePayload) > 1) { 
+                        if ($isDryRun) { 
+                            CLI::write("       [DRY RUN] Actualizaría Variante ID {$variantShopifyId}", 'light_gray'); 
+                            $this->logger->debug("[DRY_RUN][UpdateVariant] Payload: " . json_encode($variantUpdatePayload, JSON_PRETTY_PRINT));
+                        } else {
+                            $this->logger->critical("DEBUG_SSP_BEFORE_UPDATE_VARIANT: SKU {$localSku}, Payload: " . json_encode(['variant' => $variantUpdatePayload], JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE));
+                            $updateResult = $this->shopifyService->updateVariant($variantShopifyId, ['variant' => $variantUpdatePayload]);
+                            $this->logger->critical("DEBUG_SSP_AFTER_UPDATE_VARIANT: SKU {$localSku}, Response: " . json_encode($updateResult, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE));
+                            if ($updateResult) {
+                                CLI::write("       Variante ID {$variantShopifyId} actualizada.", 'green');
+                                $inventoryItemId = $updateResult['inventory_item_id'] ?? $inventoryItemId;
+                                $updateDbData = [];
+                                if (($lv['idshopify'] ?? null) != $variantShopifyId) $updateDbData['idshopify'] = $variantShopifyId;
+                                if ($inventoryItemId && ($lv['inventory_idshopify'] ?? null) != $inventoryItemId) $updateDbData['inventory_idshopify'] = $inventoryItemId;
+                                if ($dbImageIdToSaveForVariant && ($lv['image_idshopify'] ?? null) != $dbImageIdToSaveForVariant) $updateDbData['image_idshopify'] = $dbImageIdToSaveForVariant;
+                                if (!empty($updateDbData)) $this->variantModel->update($lv['id'], $updateDbData);
+                            } else { CLI::error("       Fallo actualizar Variante ID {$variantShopifyId}."); $variantErrorCountInternal++;}
+                        }
+                    } else {
+                        CLI::write("     - Variante SKU {$localSku} (ID {$variantShopifyId}): No hay cambios detectados para actualizar (excepto imagen/stock).", 'dark_gray');
+                        if (!$isDryRun && $dbImageIdToSaveForVariant && ($lv['image_idshopify'] ?? null) != $dbImageIdToSaveForVariant) {
+                            $this->variantModel->update($lv['id'], ['image_idshopify' => $dbImageIdToSaveForVariant]);
+                            CLI::write("       - image_idshopify actualizado en BD para SKU {$localSku} (sin otros cambios de variante).", 'light_blue');
+                        }
+                    }
+                } else { 
+                    CLI::write("     - Variante SKU {$localSku} NO encontrada en producto Shopify ID {$shopifyProductId}. Creando...", 'yellow');
+                    $this->logger->warning("[syncSingleProduct][Update] Variant SKU {$localSku} not found in Shopify product {$shopifyProductId}. Attempting to create.");
+                    $variantCreatePayload = $preparedVariantDataForShopify;
+                    if ($shopifyImageIdToAssign) { $variantCreatePayload['image_id'] = $shopifyImageIdToAssign; } 
+                    
+                    if ($isDryRun) { 
+                        CLI::write("       [DRY RUN] Crearía variante para prod ID {$shopifyProductId}", 'light_gray'); 
+                        $this->logger->debug("[DRY_RUN][CreateVariantInUpdate] Payload: " . json_encode($variantCreatePayload, JSON_PRETTY_PRINT));
+                        $createResult = ['id' => 'dry_run_new_variant_id_' . $localSku, 'inventory_item_id' => 'dry_run_new_inv_item_id_' . $localSku]; 
+                    } else {
+                        $this->logger->critical("DEBUG_SSP_BEFORE_CREATE_VARIANT_IN_UPDATE_FLOW: SKU {$localSku}, Payload: " . json_encode(['variant' => $variantCreatePayload], JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE));
+                        $createResult = $this->shopifyService->createVariant($shopifyProductId, ['variant' => $variantCreatePayload]);
+                        $this->logger->critical("DEBUG_SSP_AFTER_CREATE_VARIANT_IN_UPDATE_FLOW: SKU {$localSku}, Response: " . json_encode($createResult, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE));
+                        if ($createResult && isset($createResult['id'])) {
+                            CLI::write("       Nueva variante creada (dentro de flujo de actualización). ID: {$createResult['id']}", 'green'); 
+                            $variantShopifyIdToUseInAPI = $createResult['id']; 
+                            $inventoryItemId = $createResult['inventory_item_id'] ?? null;
+                            $this->variantModel->update($lv['id'], ['idshopify' => $variantShopifyIdToUseInAPI, 'inventory_idshopify' => $inventoryItemId, 'image_idshopify' => $dbImageIdToSaveForVariant]); 
+                            CLI::write("       IDs guardados BD local (VarLocalID: {$lv['id']}).", 'light_blue');
+                        } else { CLI::error("       Fallo crear variante SKU {$localSku} (dentro de flujo de actualización)."); $variantErrorCountInternal++; }
+                    }
+                }
+                
+                $variantIdForStockCheck = $variantShopifyIdToUseInAPI ?? ($variantShopifyId ?? ($createResult['id'] ?? null)); 
+                if ($variantIdForStockCheck && $inventoryItemId) {
+                     $stockTotal = (int)($lv['stock_gdl'] ?? 0) + (int)($lv['stock_mty'] ?? 0) + (int)($lv['stock_edomex'] ?? 0);
+                     CLI::write("         - Set stock: {$stockTotal} para InvItemID {$inventoryItemId} (Variante Shopify ID {$variantIdForStockCheck}) en LocID {$locationId}", 'light_cyan');
+                     if ($isDryRun) { CLI::write("           [DRY RUN] Set stock a {$stockTotal}", "light_gray"); } 
+                     else { 
+                        $this->logger->critical("DEBUG_SSP_BEFORE_SET_INVENTORY_UPDATE: SKU {$localSku}, InvItemID: {$inventoryItemId}, Qty: {$stockTotal}");
+                        $stockSetResult = $this->shopifyService->setInventoryLevel($inventoryItemId, $locationId, $stockTotal); 
+                        $this->logger->critical("DEBUG_SSP_AFTER_SET_INVENTORY_UPDATE: SKU {$localSku}, Response: " . json_encode($stockSetResult, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE));
+                        if ($stockSetResult) { CLI::write("         - Stock SKU {$localSku} actualizado a {$stockTotal}.", 'green'); } else { CLI::error("         - Fallo stock SKU {$localSku}."); } 
+                    }
+                 } elseif ($isDryRun && !$inventoryItemId && $variantIdForStockCheck) { CLI::write("         - [DRY RUN] No InvItemID para SKU {$localSku}. No se actualiza stock.", 'yellow'); }
+                   elseif (!$isDryRun && $variantIdForStockCheck && !$inventoryItemId) { CLI::write("         - ADV: No InvItemID para SKU {$localSku}. No se actualiza stock.", 'yellow'); $this->logger->warning("[syncSingleProduct][Update] No inventory_item_id for SKU {$localSku} to update stock.");}
+                $this->logger->critical("DEBUG_SSP_VARIANT_LOOP_END_UPDATE: LocalVariantSKU {$localSku}");
+            } 
+            CLI::write("     Resumen variantes para producto ID {$shopifyProductId}: " . (count($localVariants) - $variantErrorCountInternal) . " OK, {$variantErrorCountInternal} errores.", $variantErrorCountInternal > 0 ? 'yellow' : 'light_green');
+            $this->logger->critical("DEBUG_SSP_UPDATE_FLOW_END: SKU {$productSku}");
+            return ($parentUpdateSuccess && $variantErrorCountInternal === 0);
+        
+        } else { // --- FLUJO DE CREACIÓN --- 
+             $this->logger->critical("DEBUG_SSP_CREATE_FLOW_START: SKU {$productSku}");
+             CLI::write(" - Creando nuevo producto en Shopify para SKU local: {$productSku} (Handle a usar: {$shopifyData['handle']})...", 'cyan');
+             if ($isDryRun) { CLI::write("   [DRY RUN] Crearía producto ({$productSku})", 'light_gray'); echo "   [DRY RUN] Datos Completos Producto:\n" . json_encode($shopifyData, JSON_PRETTY_PRINT) . "\n"; return true; }
+             
+             $this->logger->critical("DEBUG_SSP_BEFORE_CREATE_PRODUCT: SKU {$productSku}, PayloadJSON: " . json_encode($shopifyData, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE));
+             $createdProduct = $this->shopifyService->createProduct($shopifyData); 
+             $this->logger->critical("DEBUG_SSP_AFTER_CREATE_PRODUCT: SKU {$productSku}, ResponseJSON: " . json_encode($createdProduct, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE));
+
+             if ($createdProduct && isset($createdProduct['id'])) {
+                 $newShopifyId = $createdProduct['id']; 
+                 CLI::write("   Producto creado en Shopify. Nuevo ID Shopify: {$newShopifyId}", 'green');
+                 $this->parentModel->update($productIdLocal, ['idshopify' => $newShopifyId]); 
+                 CLI::write("   ID Shopify {$newShopifyId} guardado en BD local para SKU {$productSku}.", 'green'); 
+                 
+                 $shopifyImagesFromCreate = $createdProduct['images'] ?? [];
+                 $this->updateParentImageShopifyIds($productIdLocal, $parentProduct['image_parent'] ?? null, $parentProduct['image_vector'] ?? null, $shopifyImagesFromCreate);
+                                  
+                 CLI::write("   - Procesando variantes del nuevo producto ID {$newShopifyId} para stock y asociación de imagen principal...", 'light_blue');
+                 $shopifyVariantsCreated = $createdProduct['variants'] ?? []; 
+                 $notFoundImageUrl = "https://www.contenidopromo.com/Images/Items/notFound.jpg";
+
+                 foreach ($localVariants as $lv) { 
+                     $localSku = trim($lv['sku'] ?? '');
+                     $variantShopifyIdForAssoc = null;
+                     $inventoryItemId = null;
+                     $shopifyImageIdToAssign = null; 
+                     $dbImageIdToSaveForVariant = null; 
+                     $this->logger->critical("DEBUG_SSP_CREATE_VARIANT_LOOP_START: LocalVariantSKU {$localSku}");
+
+                     foreach($shopifyVariantsCreated as $sv_created){ 
+                         if( ($sv_created['sku'] ?? '') === $localSku ){ 
+                             $variantShopifyIdForAssoc = $sv_created['id'];
+                             $inventoryItemId = $sv_created['inventory_item_id'];
+                             break; 
+                         } 
+                     }
+
+                     if (!$variantShopifyIdForAssoc) {
+                         CLI::write("     - ADV: Variante local SKU {$localSku} no encontrada en la respuesta de creación del producto. No se puede asociar imagen ni guardar IDs.", 'yellow');
+                         $this->logger->warning("[syncSingleProduct][Create] Variante local SKU {$localSku} (Parent SKU {$productSku}) no encontrada en respuesta de createProduct. Respuesta de variantes: " . json_encode($shopifyVariantsCreated));
+                         continue; 
+                     }
+                     
+                     if (!empty($lv['image']) && trim($lv['image']) !== $notFoundImageUrl) {
+                         $rawLocalFilename = basename(strtok(trim($lv['image']), '?'));
+                         $localNameNormalized = str_replace(' ', '_', pathinfo($rawLocalFilename, PATHINFO_FILENAME));
+                         $this->logger->debug("[syncSingleProduct][Create] Seeking MAIN variant image for SKU {$localSku}. OriginalLocalFile: '{$rawLocalFilename}', NormalizedLocalNameSought: '{$localNameNormalized}'");
+
+                         $matchAttempted = false; 
+                         $expectedAltForMainVariant = trim(preg_replace('/\s+/', ' ', $this->applyTextReplacements( ($shopifyData['title'] ?? $productSku) . " - " . ($lv['color_name'] ? $this->applyTextReplacements($lv['color_name']) . " " : '') . ($lv['talla'] ? $this->applyTextReplacements($lv['talla']) . " " : '') . "- img 1" )));
+
+                         // Intento 1: Buscar por Alt Text exacto
+                         foreach ($shopifyImagesFromCreate as $sImg) { 
+                            if (isset($sImg['src']) && isset($sImg['id'])) {
+                                $shopifyImgAltTrimmed = isset($sImg['alt']) ? trim(preg_replace('/\s+/', ' ', $sImg['alt'])) : null;
+                                $this->logger->debug("[V_IMG_MAP_DEBUG] SKU {$localSku} (Main-Create Alt Attempt): Comparing ExpectedAlt: '{$expectedAltForMainVariant}', ShopifyAlt: '{$shopifyImgAltTrimmed}' (ShopifyImgID: {$sImg['id']})");
+                                if (!empty($shopifyImgAltTrimmed) && $shopifyImgAltTrimmed === $expectedAltForMainVariant) {
+                                    $this->logger->info("[V_IMG_MAP_DEBUG] SKU {$localSku} (Main-Create Alt Attempt): MATCH FOUND by EXACT Alt Text!"); 
+                                    $shopifyImageIdToAssign = $sImg['id']; 
+                                    $dbImageIdToSaveForVariant = $sImg['id']; 
+                                    CLI::write("       - [Post-Create] Imagen principal para SKU {$localSku} (LocalURL: {$lv['image']}) ENCONTRADA (Exact Alt Text). Shopify ImageID: {$shopifyImageIdToAssign}, ShopifyURL: {$sImg['src']}", 'green');
+                                    $this->logger->info("[syncSingleProduct][Create] Variant main image FOUND for SKU {$localSku} by Exact Alt Text. ShopifyID: {$sImg['id']}");
+                                    break; 
+                                }
+                                $matchAttempted = true;
+                            }
+                         }
+
+                         // Intento 2: Fallback a nombre normalizado si no se encontró por Alt
+                         if (!$dbImageIdToSaveForVariant && $matchAttempted) { // $matchAttempted asegura que el bucle anterior corrió
+                            $this->logger->debug("[V_IMG_MAP_DEBUG] SKU {$localSku} (Main-Create Fallback): Not found by Alt. Trying by Normalized Name. NormalizedLocalNameSought: '{$localNameNormalized}'");
+                            foreach ($shopifyImagesFromCreate as $sImg) {
+                                if (isset($sImg['src']) && isset($sImg['id'])) {
+                                    $rawShopifyFilename = basename(strtok(trim($sImg['src']), '?'));
+                                    $shopifyNameNormalized = str_replace(' ', '_', pathinfo($rawShopifyFilename, PATHINFO_FILENAME));
+                                    $shopifyNameNormalized = preg_replace('/_[a-f0-9]{8,}(-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i', '', $shopifyNameNormalized);
+                                    $shopifyNameNormalized = preg_replace('/_[a-f0-9]{8,}$/i', '', $shopifyNameNormalized);
+                                    $this->logger->debug("[V_IMG_MAP_DEBUG] SKU {$localSku} (Main-Create Fallback): Comparing NormLocal: '{$localNameNormalized}' with NormShopify: '{$shopifyNameNormalized}' (From ShopifyFile: '{$rawShopifyFilename}')"); 
+                                    if (!empty($localNameNormalized) && stripos($shopifyNameNormalized, $localNameNormalized) === 0) {
+                                        $this->logger->info("[V_IMG_MAP_DEBUG] SKU {$localSku} (Main-Create Fallback): MATCH FOUND by Normalized Name (stripos)!"); 
+                                        $shopifyImageIdToAssign = $sImg['id']; 
+                                        $dbImageIdToSaveForVariant = $sImg['id']; 
+                                        CLI::write("       - [Post-Create] Imagen principal para SKU {$localSku} (LocalURL: {$lv['image']}) ENCONTRADA (Normalized Name Fallback). Shopify ImageID: {$shopifyImageIdToAssign}, ShopifyURL: {$sImg['src']}", 'green');
+                                        $this->logger->info("[syncSingleProduct][Create] Variant main image FOUND for SKU {$localSku} by Normalized Name Fallback. ShopifyID: {$sImg['id']}");
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                         
+                         if (!$dbImageIdToSaveForVariant) { 
+                            if ($matchAttempted) {
+                                $this->logger->warning("[syncSingleProduct][Create] Main Variant image NOT FOUND for SKU {$localSku} after all checks. LocalURL: {$lv['image']}. NormalizedLocalName sought: '{$localNameNormalized}'");
+                            } else {
+                                $this->logger->warning("[syncSingleProduct][Create] Main Variant image NOT FOUND for SKU {$localSku} - NO Shopify images to check. LocalURL: {$lv['image']}. NormalizedLocalName sought: '{$localNameNormalized}'");
+                            }
+                         }
+                     }
+                     
+                     $updateDbData = ['idshopify' => $variantShopifyIdForAssoc];
+                     if ($inventoryItemId) $updateDbData['inventory_idshopify'] = $inventoryItemId;
+                     if ($dbImageIdToSaveForVariant && in_array('image_idshopify', $this->variantModel->allowedFields ?? [])) {
+                         $updateDbData['image_idshopify'] = $dbImageIdToSaveForVariant;
+                     }
+                     $this->variantModel->update($lv['id'], $updateDbData); 
+                     CLI::write("       - IDs (variante, inventario" . ($dbImageIdToSaveForVariant ? ", imagen principal" : "") . ") guardados en BD local para SKU {$localSku} (VarLocalID: {$lv['id']}).", 'light_gray');
+
+                     if ($variantShopifyIdForAssoc && $shopifyImageIdToAssign && !$isDryRun) {
+                          CLI::write("     - Intentando asociar imagen Shopify ID {$shopifyImageIdToAssign} a variante Shopify ID {$variantShopifyIdForAssoc} (SKU: {$localSku})", 'cyan');
+                          $this->logger->critical("DEBUG_SSP_BEFORE_ASSIGN_IMAGE_TO_VARIANT: SKU {$localSku}, VariantID: {$variantShopifyIdForAssoc}, ImageID: {$shopifyImageIdToAssign}");
+                          $assignResult = $this->shopifyService->assignImageToVariant($variantShopifyIdForAssoc, $shopifyImageIdToAssign);
+                          $this->logger->critical("DEBUG_SSP_AFTER_ASSIGN_IMAGE_TO_VARIANT: SKU {$localSku}, Response: " . json_encode($assignResult, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE));
+                          if ($assignResult) { CLI::write("       Imagen asociada exitosamente a variante.", 'green'); } 
+                          else { CLI::error("       Fallo al asociar imagen a variante SKU {$localSku}. Revisa logs."); }
+                     } elseif ($isDryRun && $variantShopifyIdForAssoc && $shopifyImageIdToAssign) { 
+                         CLI::write("       [DRY RUN] Se asociaría imagen ID {$shopifyImageIdToAssign} a variante ID {$variantShopifyIdForAssoc}", 'light_gray'); 
+                     } elseif ($variantShopifyIdForAssoc && empty($shopifyImageIdToAssign) && !empty($lv['image']) && trim($lv['image']) !== $notFoundImageUrl) {
+                         CLI::write("     - ADV: No se pudo encontrar/mapear un ID de Shopify para la imagen principal '{$lv['image']}' de la variante SKU {$localSku}. No se puede asociar.", 'yellow');
+                     }
+
+                     if ($inventoryItemId) {
+                         $stockTotal = (int)($lv['stock_gdl'] ?? 0) + (int)($lv['stock_mty'] ?? 0) + (int)($lv['stock_edomex'] ?? 0);
+                         CLI::write("     - Set stock: {$stockTotal} SKU {$localSku} (InvItemID {$inventoryItemId}) en LocID {$locationId}", 'light_cyan');
+                         if (!$isDryRun){ 
+                            $this->logger->critical("DEBUG_SSP_BEFORE_SET_INVENTORY_CREATE: SKU {$localSku}, InvItemID: {$inventoryItemId}, Qty: {$stockTotal}");
+                            $stockSetResult = $this->shopifyService->setInventoryLevel($inventoryItemId, $locationId, $stockTotal); 
+                            $this->logger->critical("DEBUG_SSP_AFTER_SET_INVENTORY_CREATE: SKU {$localSku}, Response: " . json_encode($stockSetResult, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE));
+                            if ($stockSetResult) { CLI::write("     - Stock SKU {$localSku} a {$stockTotal}.", 'green'); } else { CLI::error("     - Fallo stock SKU {$localSku}."); } 
+                        } else { CLI::write("       [DRY RUN] Set stock a {$stockTotal} SKU {$localSku}", "light_gray");}
+                     } else { CLI::write("     - ADV: No InvItemID SKU {$localSku} post-creación para actualizar stock.", 'yellow'); }
+                     $this->logger->critical("DEBUG_SSP_CREATE_VARIANT_LOOP_END: LocalVariantSKU {$localSku}");
+                 } 
+                 $this->saveVariantShopifyIds($createdProduct, $localVariants);
+                 $this->logger->critical("DEBUG_SSP_CREATE_FLOW_END: SKU {$productSku}");
+                 return true;
+             } else { 
+                 CLI::error("   Fallo al crear producto SKU {$productSku} en Shopify."); 
+                 $this->logger->error("[syncSingleProduct][Create] Fallo createProduct para SKU {$productSku}");
+                 return false; 
+            }
+        } 
+        $this->logger->critical("DEBUG_SSP_END_UNEXPECTED: SKU {$productSku}");
+        return false; 
+    }
+
+    protected function calculateFinalPrice($basePrice, ?string $priceType): string
+    {
+        $defaultErrorPrice = '0.00'; 
+        try {
+            $basePriceFloat = (float) $basePrice; 
+            if ($basePriceFloat <= 0) { $this->logger->info("[CalcFPrice] Precio base ({$basePriceFloat}) es 0 o negativo. Retornando '{$defaultErrorPrice}'."); return $defaultErrorPrice; }
+            $discountPct = (float) (getenv('APP_PROV_DISCOUNT_PCT') ?: 20.0); 
+            $marginPct = (float) (getenv('APP_MARGIN_ON_SALE_PCT') ?: 40.0);
+            $cost = $basePriceFloat; $normalizedPriceType = strtoupper(trim((string)$priceType));
+            if ($normalizedPriceType === 'NORMAL') { 
+                if ($discountPct > 0 && $discountPct < 100) { $cost = $basePriceFloat * (1 - ($discountPct / 100)); } 
+                else { $this->logger->warning("[CalcFPrice] Descuento ({$discountPct}%) inválido para tipo NORMAL. Costo: {$cost}"); } 
+            }
+            if ($marginPct < 0 || $marginPct >= 100 ) { $this->logger->error("[CalcFPrice] Margen ({$marginPct}%) inválido. Retornando costo formateado."); return number_format($cost, 2, '.', ''); }
+            $divisorMargen = 1 - ($marginPct / 100);
+            if ($divisorMargen <= 0) { $this->logger->error("[CalcFPrice] Divisor de margen ({$divisorMargen}) es <= 0. Retornando costo."); return number_format($cost, 2, '.', '');}
+            $finalPrice = $cost / $divisorMargen; 
+            return number_format($finalPrice, 2, '.', ''); 
+        } catch (\Throwable $e) {
+            $this->logger->error("[CalcFPrice] EXCEPCIÓN: " . $e->getMessage());
+            return $defaultErrorPrice; 
+        }
+    }
+
+    protected function uploadAndSaveParentImages(array $parentProduct, $shopifyProductId, bool $isDryRun): void
+{
+    CLI::write("     - Verificando/Subiendo Imágenes del Padre para Prod Shopify ID {$shopifyProductId}...", 'dark_gray');
+    $productIdLocal = $parentProduct['id'];
+    $imagesToUpdateInDb = []; // Cambiado el nombre para claridad
+    $notFoundImageUrl = "https://www.contenidopromo.com/Images/Items/notFound.jpg";
+
+    // --- Manejo de Imagen Principal del Padre ---
+    $localParentImageUrl = $parentProduct['image_parent'] ?? null;
+    $localParentImageShopifyIdField = 'image_parent_idshopify';
+    $currentParentImageShopifyId = $parentProduct[$localParentImageShopifyIdField] ?? null; // ID que ya tenemos en BD
+
+    if (!empty($localParentImageUrl) && trim($localParentImageUrl) !== $notFoundImageUrl) {
+        if (empty($currentParentImageShopifyId)) { // Solo subir si no tenemos un ID de Shopify guardado
+            CLI::write("       - Imagen Principal Padre: No hay ID Shopify local. Intentando subir URL: {$localParentImageUrl}", 'cyan');
+            if ($isDryRun) {
+                CLI::write("         [DRY RUN] Subiría imagen Principal Padre desde {$localParentImageUrl}", 'light_gray');
+            } else {
+                $encodedUrl = str_replace(' ', '%20', trim($localParentImageUrl)); // CODIFICAR URL
+                $this->logger->critical("DEBUG_SSP_UPLOAD_PARENT_IMG_START: ProductID {$shopifyProductId}, OriginalURL: {$localParentImageUrl}, EncodedURL: {$encodedUrl}");
+                
+                $productTitleForAlt = $parentProduct['title'] ?? $parentProduct['parent_code'] ?? 'Imagen Principal'; // Usar título o SKU
+                $altText = $this->applyTextReplacements($productTitleForAlt . ' - Imagen Principal');
+
+                $uploadedImage = $this->shopifyService->uploadProductImage($shopifyProductId, $encodedUrl, $altText);
+                $this->logger->critical("DEBUG_SSP_UPLOAD_PARENT_IMG_END: ProductID {$shopifyProductId}, Response: " . json_encode($uploadedImage, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE));
+
+                if ($uploadedImage && isset($uploadedImage['id'])) {
+                    CLI::write("         Imagen Principal Padre subida. ID Shopify: {$uploadedImage['id']}", 'green');
+                    if (in_array($localParentImageShopifyIdField, $this->parentModel->allowedFields ?? [])) {
+                        $imagesToUpdateInDb[$localParentImageShopifyIdField] = $uploadedImage['id'];
+                    } else {
+                        CLI::error("        ERROR CRÍTICO: Campo '{$localParentImageShopifyIdField}' no en allowedFields de ParentProductModel. No se puede guardar el ID de imagen.");
+                        $this->logger->error("[uploadAndSaveParentImages] CRITICAL: Field '{$localParentImageShopifyIdField}' not in ParentProductModel allowedFields.");
+                    }
+                } else {
+                    CLI::error("         Fallo al subir imagen Principal Padre desde URL: {$encodedUrl}. Revisa logs del servicio Shopify.");
+                    $this->logger->error("[uploadAndSaveParentImages] Failed to upload Parent Image. ProductID: {$shopifyProductId}, EncodedURL: {$encodedUrl}");
+                }
+            }
+        } else {
+            CLI::write("       - Imagen Principal del Padre ya tiene ID Shopify local: {$currentParentImageShopifyId}. No se resubirá en este flujo (uploadAndSaveParentImages).", 'light_gray');
+            $this->logger->info("[uploadAndSaveParentImages] Parent image for ProductIDLocal {$productIdLocal} already has Shopify ID {$currentParentImageShopifyId}. Skipping upload here.");
+        }
+    } elseif (trim($localParentImageUrl ?? '') === $notFoundImageUrl) {
+        CLI::write("       - Imagen principal del padre es 'notFound.jpg'. No se subirá.", 'yellow');
+    } else {
+        CLI::write("       - No hay URL para la imagen principal del padre.", 'dark_gray');
+    }
+
+    // --- Manejo de Imagen Vectorial del Padre ---
+    $localVectorImageUrl = $parentProduct['image_vector'] ?? null;
+    $localVectorImageShopifyIdField = 'image_vector_idshopify';
+    $currentVectorImageShopifyId = $parentProduct[$localVectorImageShopifyIdField] ?? null;
+
+    if (!empty($localVectorImageUrl) && trim($localVectorImageUrl) !== $notFoundImageUrl) {
+        if (empty($currentVectorImageShopifyId)) { // Solo subir si no tenemos un ID de Shopify guardado
+            CLI::write("       - Imagen Vectorial Padre: No hay ID Shopify local. Intentando subir URL: {$localVectorImageUrl}", 'cyan');
+            if ($isDryRun) {
+                CLI::write("         [DRY RUN] Subiría imagen Vectorial Padre desde {$localVectorImageUrl}", 'light_gray');
+            } else {
+                $encodedUrl = str_replace(' ', '%20', trim($localVectorImageUrl)); // CODIFICAR URL
+                $this->logger->critical("DEBUG_SSP_UPLOAD_VECTOR_IMG_START: ProductID {$shopifyProductId}, OriginalURL: {$localVectorImageUrl}, EncodedURL: {$encodedUrl}");
+
+                $productTitleForAlt = $parentProduct['title'] ?? $parentProduct['parent_code'] ?? 'Imagen Vectorial';
+                $altText = $this->applyTextReplacements($productTitleForAlt . ' - Imagen Vectorial');
+
+                $uploadedImage = $this->shopifyService->uploadProductImage($shopifyProductId, $encodedUrl, $altText);
+                $this->logger->critical("DEBUG_SSP_UPLOAD_VECTOR_IMG_END: ProductID {$shopifyProductId}, Response: " . json_encode($uploadedImage, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE));
+                
+                if ($uploadedImage && isset($uploadedImage['id'])) {
+                    CLI::write("         Imagen Vectorial Padre subida. ID Shopify: {$uploadedImage['id']}", 'green');
+                    if (in_array($localVectorImageShopifyIdField, $this->parentModel->allowedFields ?? [])) {
+                        $imagesToUpdateInDb[$localVectorImageShopifyIdField] = $uploadedImage['id'];
+                    } else {
+                        CLI::error("        ERROR CRÍTICO: Campo '{$localVectorImageShopifyIdField}' no en allowedFields de ParentProductModel. No se puede guardar el ID de imagen.");
+                        $this->logger->error("[uploadAndSaveParentImages] CRITICAL: Field '{$localVectorImageShopifyIdField}' not in ParentProductModel allowedFields.");
+                    }
+                } else {
+                    CLI::error("         Fallo al subir imagen Vectorial Padre desde URL: {$encodedUrl}. Revisa logs del servicio Shopify.");
+                    $this->logger->error("[uploadAndSaveParentImages] Failed to upload Vector Image. ProductID: {$shopifyProductId}, EncodedURL: {$encodedUrl}");
+                }
+            }
+        } else {
+            CLI::write("       - Imagen Vectorial del Padre ya tiene ID Shopify local: {$currentVectorImageShopifyId}. No se resubirá en este flujo (uploadAndSaveParentImages).", 'light_gray');
+            $this->logger->info("[uploadAndSaveParentImages] Vector image for ProductIDLocal {$productIdLocal} already has Shopify ID {$currentVectorImageShopifyId}. Skipping upload here.");
+        }
+    } elseif (trim($localVectorImageUrl ?? '') === $notFoundImageUrl) {
+        CLI::write("       - Imagen vectorial del padre es 'notFound.jpg'. No se subirá.", 'yellow');
+    } else {
+        CLI::write("       - No hay URL para la imagen vectorial del padre.", 'dark_gray');
+    }
+
+    if (!empty($imagesToUpdateInDb) && !$isDryRun) {
+        if ($this->parentModel->update($productIdLocal, $imagesToUpdateInDb)) {
+            CLI::write("       - IDs de imágenes padre (subidas en este flujo) actualizados en BD local (ID: {$productIdLocal}).", 'light_blue');
+        } else {
+            CLI::error("       - ERROR al actualizar IDs de imágenes padre (subidas en este flujo) en BD local para ID: {$productIdLocal}.");
+            $this->logger->error("[shopify:sync][uploadAndSaveParentImages] Falla al actualizar IDs imagen padre para Parent ID local: {$productIdLocal}. Datos: " . json_encode($imagesToUpdateInDb));
+        }
+    }
+}
+    
+    protected function updateParentImageShopifyIds($productIdLocal, ?string $localParentImageUrl, ?string $localVectorImageUrl, array $shopifyImages): void
+{
+    if (empty($shopifyImages)) {
+        CLI::write("     - No hay imágenes en la respuesta de Shopify para mapear IDs de padre (post-creación).", 'yellow');
+        $this->logger->warning("[updateParentImageShopifyIds] Called with empty shopifyImages array for ProductIDLocal: {$productIdLocal}");
+        return;
+    }
+    CLI::write("     - Mapeando IDs de imágenes padre desde respuesta de creación de Shopify...", 'dark_gray');
+    $this->logger->debug("[updateParentImageShopifyIds] ProductIDLocal: {$productIdLocal}, LocalParentURL: " . ($localParentImageUrl ?? 'N/A') . ", LocalVectorURL: " . ($localVectorImageUrl ?? 'N/A') . ", ShopifyImages count: " . count($shopifyImages));
+
+    $updates = [];
+    $notFoundImageUrl = "https://www.contenidopromo.com/Images/Items/notFound.jpg";
+
+    // Normalizar nombres de archivo locales: quitar extensión y reemplazar espacios con '_'
+    $rawLocalParentFilename = ($localParentImageUrl && trim($localParentImageUrl) !== $notFoundImageUrl) ? basename(strtok(trim($localParentImageUrl), '?')) : null;
+    $localParentNameNormalized = $rawLocalParentFilename ? str_replace(' ', '_', pathinfo($rawLocalParentFilename, PATHINFO_FILENAME)) : null;
+
+    $rawLocalVectorFilename = ($localVectorImageUrl && trim($localVectorImageUrl) !== $notFoundImageUrl) ? basename(strtok(trim($localVectorImageUrl), '?')) : null;
+    $localVectorNameNormalized = $rawLocalVectorFilename ? str_replace(' ', '_', pathinfo($rawLocalVectorFilename, PATHINFO_FILENAME)) : null;
+
+    $this->logger->debug("[updateParentImageShopifyIds] NormalizedLocalParentSought: " . ($localParentNameNormalized ?? 'N/A') . ", NormalizedLocalVectorSought: " . ($localVectorNameNormalized ?? 'N/A'));
+
+    $parentImageShopifyIdFound = null;
+    $vectorImageShopifyIdFound = null;
+    
+    $productTitleForAlt = null;
+    $parentProductDataForAlt = null; 
+    if ($localParentNameNormalized || $localVectorNameNormalized) { 
+        $parentProductDataForAlt = $this->parentModel->find($productIdLocal);
+        if ($parentProductDataForAlt) {
+            $productTitleForAlt = $parentProductDataForAlt['title'] ?? '';
+        } else {
+            $this->logger->error("[updateParentImageShopifyIds] Could not find parent product data for IDLocal: {$productIdLocal} to generate alt text.");
+        }
+    }
+
+    foreach ($shopifyImages as $idx => $sImage) { 
+        if (empty($sImage['id']) || empty($sImage['src'])) {
+            $this->logger->debug("[updateParentImageShopifyIds] ShopifyImage #{$idx} skipped (no id or src).");
+            continue;
+        }
+
+        $rawShopifyFilename = basename(strtok(trim($sImage['src']), '?'));
+        $shopifyNameNormalized = str_replace(' ', '_', pathinfo($rawShopifyFilename, PATHINFO_FILENAME));
+        // Quitar hashes comunes de Shopify
+        $shopifyNameNormalized = preg_replace('/_[a-f0-9]{8,}(-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i', '', $shopifyNameNormalized); // UUID hash
+        $shopifyNameNormalized = preg_replace('/_[a-f0-9]{8,}$/i', '', $shopifyNameNormalized); // hash corto
+
+        $shopifyImgAlt = $sImage['alt'] ?? null;
+        $this->logger->debug("[updateParentImageShopifyIds] Processing ShopifyImage #{$idx}: NormalizedShopifyName: '{$shopifyNameNormalized}', OriginalShopifyFile: '{$rawShopifyFilename}', Alt: '" . ($shopifyImgAlt ?? 'N/A') . "', ShopifyID: {$sImage['id']}");
+
+        // Mapeo para Imagen Principal del Padre
+        if (!$parentImageShopifyIdFound && $localParentNameNormalized) {
+            $this->logger->debug("[updateParentImageShopifyIds] Attempting PARENT. NormalizedLocal: '{$localParentNameNormalized}'");
+            if (stripos($shopifyNameNormalized, $localParentNameNormalized) === 0) { // Comparar si ShopifyName comienza con LocalName
+                $parentAltText = $this->applyTextReplacements(($productTitleForAlt ?? ($parentProductDataForAlt['parent_code'] ?? '')) . ' - Imagen Principal');
+                $this->logger->debug("[updateParentImageShopifyIds] Parent: stripos OK. Comparing Alt. ExpectedAlt: '{$parentAltText}', ShopifyImgAlt: '" . ($shopifyImgAlt ?? 'N/A') . "'");
+                if ($shopifyImgAlt === $parentAltText) {
+                    if (in_array('image_parent_idshopify', $this->parentModel->allowedFields ?? [])) {
+                        $updates['image_parent_idshopify'] = $sImage['id'];
+                        $parentImageShopifyIdFound = $sImage['id'];
+                        CLI::write("       - Imagen Principal Padre ('{$localParentImageUrl}') mapeada a ID Shopify: {$sImage['id']} (Por Nombres Normalizados y Alt)", 'green');
+                        $this->logger->info("[updateParentImageShopifyIds] Parent image mapped (NormalizedNames+Alt): {$sImage['id']} for URL {$sImage['src']}");
+                    }
+                }
+            }
+        }
+
+        // Mapeo para Imagen Vectorial del Padre
+        if (!$vectorImageShopifyIdFound && $localVectorNameNormalized && $sImage['id'] != $parentImageShopifyIdFound) { 
+            $this->logger->debug("[updateParentImageShopifyIds] Attempting VECTOR. NormalizedLocal: '{$localVectorNameNormalized}'");
+            if (stripos($shopifyNameNormalized, $localVectorNameNormalized) === 0) { // Comparar si ShopifyName comienza con LocalName
+                $vectorAltText = $this->applyTextReplacements(($productTitleForAlt ?? ($parentProductDataForAlt['parent_code'] ?? '')) . ' - Imagen Vectorial');
+                $this->logger->debug("[updateParentImageShopifyIds] Vector: stripos OK. Comparing Alt. ExpectedAlt: '{$vectorAltText}', ShopifyImgAlt: '" . ($shopifyImgAlt ?? 'N/A') . "'");
+                if ($shopifyImgAlt === $vectorAltText) {
+                    if (in_array('image_vector_idshopify', $this->parentModel->allowedFields ?? [])) {
+                        $updates['image_vector_idshopify'] = $sImage['id'];
+                        $vectorImageShopifyIdFound = $sImage['id'];
+                        CLI::write("       - Imagen Vectorial Padre ('{$localVectorImageUrl}') mapeada a ID Shopify: {$sImage['id']} (Por Nombres Normalizados y Alt)", 'green');
+                        $this->logger->info("[updateParentImageShopifyIds] Vector image mapped (NormalizedNames+Alt): {$sImage['id']} for URL {$sImage['src']}");
+                    }
+                }
+            }
+        }
+        
+        // Reinsertar breaks ya que esta lógica debería ser suficiente si los nombres/alts son únicos
+        if ($parentImageShopifyIdFound && $vectorImageShopifyIdFound && $localParentNameNormalized && $localVectorNameNormalized) { 
+             break; 
+        } elseif ($parentImageShopifyIdFound && !$localVectorNameNormalized) { // Solo se esperaba la del padre
+            break;
+        } elseif ($vectorImageShopifyIdFound && !$localParentNameNormalized) { // Solo se esperaba la vectorial
+            break;
+        }
+    } // Fin del bucle foreach
+
+    if (!empty($updates)) {
+        if ($this->parentModel->update($productIdLocal, $updates)) {
+            CLI::write("       - IDs de imágenes padre (post-creación) actualizados en BD local (ID: {$productIdLocal}).", 'light_blue');
+        } else {
+            CLI::error("       - ERROR al actualizar IDs de imágenes padre (post-creación) en BD local para ID: {$productIdLocal}.");
+            $this->logger->error("[shopify:sync][updateParentImageShopifyIds] Falla al actualizar IDs imagen padre para Parent ID local: {$productIdLocal}. Datos: " . json_encode($updates));
+        }
+    } else {
+        CLI::write("     - No se encontraron coincidencias para IDs de imágenes padre (post-creación).", 'light_gray');
+        $logParentFile = $localParentNameNormalized ?? 'N/A (Original: ' . ($rawLocalParentFilename ?? 'N/A') . ')';
+        $logVectorFile = $localVectorNameNormalized ?? 'N/A (Original: ' . ($rawLocalVectorFilename ?? 'N/A') . ')';
+        $this->logger->warning("[updateParentImageShopifyIds] No matches found for parent/vector images. ProductIDLocal: {$productIdLocal}. NormalizedLocalParent: {$logParentFile}, NormalizedLocalVector: {$logVectorFile}. Shopify Images (sample): " . json_encode(array_slice($shopifyImages, 0, 3))); 
+    }
+} // Fin de la función updateParentImageShopifyIds
+
+    protected function saveVariantShopifyIds(array $shopifyProduct, array $localVariants): void
+{
+    CLI::write("   - Guardando IDs de Shopify (imágenes secundarias) en BD local...", 'light_blue');
+    // $shopifyVariantsData = $shopifyProduct['variants'] ?? []; // No se usa directamente aquí
+    $shopifyImagesData = $shopifyProduct['images'] ?? [];
+    
+    $notFoundImageUrl = "https://www.contenidopromo.com/Images/Items/notFound.jpg";
+    $updatedCount = 0;
+    $errorCount = 0;
+
+    // Verificar si hay imágenes de Shopify para mapear
+    if (empty($shopifyImagesData)) {
+        $hasLocalSecondaryImagesToCheck = false;
+        foreach ($localVariants as $lv_check) {
+            for ($i = 2; $i <= 9; $i++) {
+                $lf = 'image_' . $i;
+                if (!empty($lv_check[$lf]) && trim($lv_check[$lf]) !== $notFoundImageUrl && empty($lv_check[$lf . '_idshopify'])) {
+                    $hasLocalSecondaryImagesToCheck = true;
+                    break 2;
+                }
+            }
+        }
+        if ($hasLocalSecondaryImagesToCheck) {
+            CLI::write("     - ADVERTENCIA: No hay imágenes en la respuesta de Shopify para mapear a imágenes secundarias de variantes.", 'yellow');
+            $this->logger->warning("[saveVariantShopifyIds] Shopify product response has no images, but local variants have unmapped secondary images.");
+        }
+        // Continuar por si en el futuro esta función guarda otros IDs además de imágenes.
+    }
+
+    foreach ($localVariants as $lv) {
+        $localSku = trim($lv['sku'] ?? '');
+        $dataToUpdate = [];
+
+        for ($i = 2; $i <= 9; $i++) { 
+            $localImgFieldUrlKey = 'image_' . $i;
+            $localImgFieldIdShopifyKey = $localImgFieldUrlKey . '_idshopify';
+
+            if (in_array($localImgFieldIdShopifyKey, $this->variantModel->allowedFields ?? []) &&
+                !empty($lv[$localImgFieldUrlKey]) &&
+                trim($lv[$localImgFieldUrlKey]) !== $notFoundImageUrl &&
+                empty($lv[$localImgFieldIdShopifyKey])) { // Solo intentar si no tenemos ya un ID
+
+                $rawLocalSecondaryFilename = basename(strtok(trim($lv[$localImgFieldUrlKey]), '?'));
+                $localSecondaryNameNormalized = str_replace(' ', '_', pathinfo($rawLocalSecondaryFilename, PATHINFO_FILENAME)); // Normalizar local
+                
+                $foundSecondaryMatch = false;
+
+                if (empty($shopifyImagesData)) {
+                     $this->logger->warning("[SAVE_VAR_IMG_DEBUG] No Shopify images to map against for secondary image. ProductIDLocal: {$lv['id_parent']}, SKU {$localSku}, Field {$localImgFieldUrlKey}, NormalizedLocal: '{$localSecondaryNameNormalized}'");
+                     continue; 
+                }
+
+                foreach ($shopifyImagesData as $sImg) {
+                    if (isset($sImg['src']) && isset($sImg['id'])) {
+                        $rawShopifyFilename = basename(strtok(trim($sImg['src']), '?'));
+                        $shopifyNameNormalized = str_replace(' ', '_', pathinfo($rawShopifyFilename, PATHINFO_FILENAME));
+                        $shopifyNameNormalized = preg_replace('/_[a-f0-9]{8,}(-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i', '', $shopifyNameNormalized);
+                        $shopifyNameNormalized = preg_replace('/_[a-f0-9]{8,}$/i', '', $shopifyNameNormalized);
+                        
+                        $this->logger->debug("[SAVE_VAR_IMG_DEBUG] SKU {$localSku}, Field {$localImgFieldUrlKey}: Comparing NormLocal: '{$localSecondaryNameNormalized}' with NormShopify: '{$shopifyNameNormalized}' (OriginalShopifyFile: '{$rawShopifyFilename}')");
+
+                        if (!empty($localSecondaryNameNormalized) && stripos($shopifyNameNormalized, $localSecondaryNameNormalized) === 0) {
+                            // Para imágenes secundarias, la coincidencia de nombre normalizado podría ser suficiente,
+                            // ya que el alt text es menos predecible o específico para img_2, img_3, etc.
+                            // Podríamos añadir una comprobación de alt text si es necesario, pero sería más compleja
+                            // de generar de forma consistente para img_2 en adelante.
+                            $this->logger->info("[SAVE_VAR_IMG_DEBUG] SKU {$localSku}, Field {$localImgFieldUrlKey}: MATCH FOUND by Normalized Names!");
+                            $dataToUpdate[$localImgFieldIdShopifyKey] = $sImg['id'];
+                            CLI::write("       - Mapeada imagen secundaria '{$localImgFieldUrlKey}' a ID Shopify {$sImg['id']} SKU {$localSku} (Por Nombres Normalizados)", 'green');
+                            $this->logger->info("[saveVariantShopifyIds] Secondary image {$localImgFieldUrlKey} mapped to ID {$sImg['id']} for SKU {$localSku}");
+                            $foundSecondaryMatch = true;
+                            break; 
+                        }
+                    }
+                } 
+
+                if (!$foundSecondaryMatch) {
+                    $this->logger->warning("[SAVE_VAR_IMG_DEBUG] Secondary image NOT FOUND. ProductIDLocal: {$lv['id_parent']}, SKU {$localSku}, Field {$localImgFieldUrlKey}, NormalizedLocalSought: '{$localSecondaryNameNormalized}', OriginalLocalURL: {$lv[$localImgFieldUrlKey]}");
+                    CLI::write("       - ADV: URL de imagen secundaria '{$lv[$localImgFieldUrlKey]}' (NormLocal: {$localSecondaryNameNormalized}) no encontrada en galería Shopify para SKU {$localSku}", 'yellow');
+                }
+            }
+        } 
+
+        if (!empty($dataToUpdate)) {
+            if ($this->variantModel->update($lv['id'], $dataToUpdate)) {
+                CLI::write("     - IDs Shopify (imágenes secundarias) guardados/actualizados para SKU {$localSku} (VarLocalID: {$lv['id']})", 'light_blue');
+                $updatedCount++;
+            } else {
+                CLI::error("     - ERROR guardando IDs Shopify (imágenes secundarias) para SKU {$localSku}");
+                $this->logger->error("[shopify:sync][saveVariantShopifyIds] Falla al actualizar IDs (imágenes secundarias) para Variant ID local: {$lv['id']}. Datos: " . json_encode($dataToUpdate));
+                $errorCount++;
+            }
+        }
+    } 
+
+    CLI::write("   - Resumen guardado IDs (imágenes secundarias): {$updatedCount} variantes con algún ID de imagen secundaria actualizado, {$errorCount} errores.", $errorCount > 0 ? 'yellow' : 'light_blue');
+}
+} // Fin de la clase ShopifySyncCommand
