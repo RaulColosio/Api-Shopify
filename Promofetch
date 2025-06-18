@@ -1,0 +1,379 @@
+<?php
+
+// app/Commands/PromoFetchCommand.php (Versión 4.2 - Normalización de SKUs)
+
+namespace App\Commands;
+
+use CodeIgniter\CLI\BaseCommand;
+use CodeIgniter\CLI\CLI;
+use App\Services\PromoopcionService;
+use App\Models\ParentProductModel;
+use App\Models\VariantProductModel;
+use Config\Services; 
+
+class PromoFetchCommand extends BaseCommand
+{
+    protected $group = 'Promoopcion';
+    protected $name = 'promo:fetch';
+    protected $description = 'Obtiene productos y/o stocks de la API de Promoopción y los guarda/actualiza en la BD local.';
+    protected $usage = 'promo:fetch [--full | --stock-only] [--limit=N]';
+    protected $options = [
+        '--full' => 'Obtiene todos los productos (detalles y variantes) Y luego actualiza todos los stocks.',
+        '--stock-only' => 'Obtiene y actualiza UNICAMENTE los niveles de stock.',
+        '--limit' => 'Limita el número de productos padre a procesar desde la API (solo aplica con --full, para pruebas).',
+    ];
+
+    protected PromoopcionService $promoService;
+    protected ParentProductModel $parentModel;
+    protected VariantProductModel $variantModel;
+    protected $logger; 
+
+    public function __construct()
+    {
+        $this->promoService = new PromoopcionService();
+        $this->parentModel = new ParentProductModel();
+        $this->variantModel = new VariantProductModel();
+        $this->logger = Services::logger(); 
+    }
+
+    public function run(array $params)
+    {
+        CLI::write('*** Iniciando Comando promo:fetch ***', 'green');
+
+        $isFullFetch = CLI::getOption('full');
+        $isStockOnly = CLI::getOption('stock-only');
+        $limit = CLI::getOption('limit');
+
+        if ($isFullFetch && $isStockOnly) {
+            CLI::error('Error: Las opciones --full y --stock-only son mutuamente excluyentes. Elija solo una.');
+            CLI::write($this->usage, 'yellow');
+            return EXIT_USER_INPUT;
+        }
+
+        if (!$isFullFetch && !$isStockOnly) {
+            CLI::error('Error: Debe especificar una opción de operación: --full o --stock-only.');
+            CLI::write($this->usage, 'yellow');
+            return EXIT_USER_INPUT;
+        }
+        
+        if ($limit !== null) {
+            if (!is_numeric($limit) || (int)$limit <= 0) {
+                CLI::error("Error: Opción --limit inválida. Debe ser un número positivo.");
+                return EXIT_USER_INPUT;
+            }
+            $limit = (int)$limit;
+            if ($isStockOnly) {
+                CLI::write("Advertencia: La opción --limit no aplica con --stock-only y será ignorada.", 'yellow');
+            }
+        }
+
+        if ($isStockOnly) {
+            CLI::write('MODO: Actualización de SOLO STOCK seleccionada.', 'blue');
+            $this->runStockOnlyOperations();
+        }
+
+        if ($isFullFetch) {
+            CLI::write('MODO: Fetch COMPLETO (Productos y Stock) seleccionado.', 'blue');
+            if ($limit) {
+                 CLI::write("Se aplicará un LÍMITE de {$limit} productos padre para el procesamiento de detalles.", 'yellow');
+            }
+            $this->runFullFetchOperations($limit);
+        }
+
+        CLI::newLine();
+        CLI::write('*** Comando promo:fetch Finalizado ***', 'green');
+        return EXIT_SUCCESS;
+    }
+
+    protected function runFullFetchOperations(?int $limit = null): void
+    {
+        CLI::write('Iniciando fetch de DETALLES DE PRODUCTOS de Promoopción...', 'cyan');
+        $apiProducts = $this->promoService->getProducts();
+
+        if ($apiProducts === null) {
+            CLI::error('Fallo al obtener productos de Promoopción.');
+        } elseif (empty($apiProducts)) {
+            CLI::write('No se encontraron productos en Promoopción (respuesta vacía de la API).', 'yellow');
+        } else {
+            CLI::write(count($apiProducts) . ' productos padre recibidos de la API.', 'cyan');
+
+            $apiProductsToProcess = $apiProducts;
+            if ($limit !== null && count($apiProducts) > $limit) {
+                CLI::write("Aplicando límite de {$limit} productos para procesamiento de detalles.", 'yellow');
+                $apiProductsToProcess = array_slice($apiProducts, 0, $limit);
+            }
+
+            $parentCreatedCount = 0; $parentUpdatedCount = 0; $parentErrorCount = 0;
+            $variantCreatedCount = 0; $variantUpdatedCount = 0; $variantErrorCount = 0;
+            $processedParentCount = 0;
+
+            if (!empty($apiProductsToProcess)) {
+                foreach ($apiProductsToProcess as $apiParent) {
+                    $processedParentCount++;
+                    $skuPadre = $apiParent['skuPadre'] ?? null;
+
+                    if (empty($skuPadre)) {
+                        CLI::write(" - Producto #{$processedParentCount} API sin skuPadre. Saltando.", 'yellow');
+                        $this->logger->warning("[promo:fetch][Full] API Producto sin skuPadre: " . json_encode($apiParent));
+                        $parentErrorCount++;
+                        continue;
+                    }
+                    CLI::newLine();
+                    CLI::write("[{$processedParentCount}/" . count($apiProductsToProcess) . "] Procesando Detalles SKU Padre API: {$skuPadre}", 'blue');
+
+                    try {
+                        $parentData = [
+                            'parent_code' => $skuPadre, 'title' => $apiParent['nombrePadre'] ?? null, 'description' => $apiParent['descripcion'] ?? null,
+                            'category_name' => $apiParent['categorias'] ?? null, 'id_provider' => 1, 'material' => $apiParent['material'] ?? null,
+                            'capacity' => $apiParent['capacidad'] ?? null, 'print_tech' => $apiParent['impresion']['tecnicaImpresion'] ?? null,
+                            'print_area' => $apiParent['impresion']['areaImpresion'] ?? null, 'product_size' => $apiParent['medidas'] ?? null,
+                            'box_size' => ($apiParent['paquete']['largo'] ?? '') . 'x' . ($apiParent['paquete']['ancho'] ?? '') . 'x' . ($apiParent['paquete']['alto'] ?? ''),
+                            'box_weight' => $apiParent['paquete']['pesoBruto'] ?? null, 'box_count' => $apiParent['paquete']['PiezasCaja'] ?? null,
+                            'box_individual' => (strtoupper($apiParent['paquete']['cajaIndividual'] ?? 'NO') === 'SI' ? 1 : 0),
+                            'image_parent' => $apiParent['imagenesPadre'][0] ?? null, 'image_vector' => $apiParent['imagenesVector'][0] ?? null,
+                        ];
+                        $parentData = array_filter($parentData, fn($value) => $value !== null);
+                        $existingLocalParent = $this->parentModel->findBySku($skuPadre);
+                        $parentIdLocal = null;
+
+                        if ($existingLocalParent) {
+                            $parentIdLocal = $existingLocalParent['id'];
+                            CLI::write(" - SKU Padre {$skuPadre} encontrado BD (ID: {$parentIdLocal}). Actualizando...", 'yellow');
+                            if ($this->parentModel->update($parentIdLocal, $parentData)) {
+                                CLI::write("   - Padre ID {$parentIdLocal} actualizado.", 'green');
+                                $parentUpdatedCount++;
+                            } else {
+                                CLI::error("   - ERR al actualizar padre ID {$parentIdLocal}.");
+                                $this->logger->error("[promo:fetch][Full] Err DB actualizar Parent SKU {$skuPadre}: " . json_encode($this->parentModel->errors()));
+                                $parentErrorCount++;
+                                continue; 
+                            }
+                        } else {
+                            CLI::write(" - SKU Padre {$skuPadre} NO encontrado BD. Creando...", 'cyan');
+                            if (in_array('active', $this->parentModel->allowedFields ?? []) && !isset($parentData['active'])) {
+                                $parentData['active'] = 1; 
+                            }
+                            $parentIdLocal = $this->parentModel->insert($parentData, true);
+                            if ($parentIdLocal) {
+                                CLI::write("   - Nuevo padre creado BD. ID: {$parentIdLocal}", 'green');
+                                $parentCreatedCount++;
+                            } else {
+                                CLI::error("   - ERR al crear padre SKU {$skuPadre}.");
+                                $this->logger->error("[promo:fetch][Full] Err DB insertar Parent SKU {$skuPadre}: " . json_encode($this->parentModel->errors()));
+                                $parentErrorCount++;
+                                continue; 
+                            }
+                        }
+
+                        if ($parentIdLocal && isset($apiParent['hijos']) && is_array($apiParent['hijos'])) {
+                            list($vc, $vu, $ve) = $this->processVariants($parentIdLocal, $apiParent['hijos']);
+                            $variantCreatedCount += $vc;
+                            $variantUpdatedCount += $vu;
+                            $variantErrorCount += $ve;
+                        } elseif ($parentIdLocal) {
+                            CLI::write("   - No hay 'hijos' (variantes) en API para SKU Padre {$skuPadre}.", 'yellow');
+                        }
+                    } catch (\Throwable $e) {
+                        CLI::error(" - ERROR procesando SKU Padre {$skuPadre}: " . $e->getMessage());
+                        $this->logger->error("[promo:fetch][Full] Excepción SKU Padre {$skuPadre}. File: " . $e->getFile() . " Line: " . $e->getLine() . "\n" . $e->getTraceAsString());
+                        $parentErrorCount++;
+                    }
+                    if ($limit === null || $processedParentCount < $limit ) { 
+                       usleep(50000); 
+                    }
+                }
+            } else {
+                CLI::write('No hay productos detallados para procesar (debido a API vacía o ya procesados).', 'yellow');
+            }
+
+            CLI::newLine();
+            CLI::write("--- Resumen Procesamiento de Detalles (Modo Full) ---", 'green');
+            CLI::write("Productos Padre API intentados (detalles): " . $processedParentCount, 'cyan');
+            CLI::write("Padres Creados en BD: " . $parentCreatedCount, 'green');
+            CLI::write("Padres Actualizados en BD: " . $parentUpdatedCount, 'green');
+            CLI::write("Errores en Padres: " . $parentErrorCount, $parentErrorCount > 0 ? 'red' : 'green');
+            CLI::newLine();
+            CLI::write("Variantes Creadas en BD: " . $variantCreatedCount, 'green');
+            CLI::write("Variantes Actualizadas en BD: " . $variantUpdatedCount, 'green');
+            CLI::write("Errores en Variantes: " . $variantErrorCount, $variantErrorCount > 0 ? 'red' : 'green');
+        } 
+
+        CLI::newLine();
+        CLI::write('Iniciando sincronización de STOCKS (como parte del modo --full)...', 'cyan');
+        $this->syncPromoStocks(); 
+    }
+
+    protected function runStockOnlyOperations(): void
+    {
+        CLI::write('Iniciando sincronización de STOCKS ÚNICAMENTE (modo --stock-only)...', 'cyan');
+        $this->syncPromoStocks(); 
+    }
+
+    protected function processVariants(int $parentIdLocal, array $apiVariants): array
+    {
+        CLI::write("   - Procesando " . count($apiVariants) . " variantes para padre ID {$parentIdLocal}...", 'light_blue');
+        $created = 0; $updated = 0; $errors = 0;
+        foreach ($apiVariants as $apiVariant) {
+            $rawSkuHijo = $apiVariant['skuHijo'] ?? null; // SKU tal como viene de la API all-products
+            if (empty($rawSkuHijo)) {
+                CLI::write("     - Variante API sin skuHijo. Saltando.", 'yellow');
+                $this->logger->warning("[promo:fetch][Var] Variante API sin skuHijo para Parent ID {$parentIdLocal}: " . json_encode($apiVariant));
+                $errors++;
+                continue;
+            }
+
+            // **** NORMALIZACIÓN DE SKUHIJO (eliminar guion al final) ****
+            $skuHijo = rtrim(trim($rawSkuHijo), '-');
+            // **** FIN NORMALIZACIÓN ****
+            
+            if ($rawSkuHijo !== $skuHijo) {
+                CLI::write("     - Procesando SKU Hijo API (Original: '{$rawSkuHijo}', Normalizado: '{$skuHijo}')", 'dark_gray');
+            } else {
+                CLI::write("     - Procesando SKU Hijo API: {$skuHijo}", 'dark_gray');
+            }
+
+            try {
+                $variantData = [
+                    'id_parent' => $parentIdLocal, 
+                    'sku' => $skuHijo, // Guardar el SKU normalizado
+                    'color_name' => $apiVariant['color'] ?? null,
+                    'talla' => $apiVariant['talla'] ?? null,
+                    'tipo' => $apiVariant['tipo'] ?? null,
+                    'price' => $apiVariant['precio'] ?? null,
+                    // Los campos de stock se llenarán/actualizarán por syncPromoStocks
+                    // O, si implementamos la Opción 4, aquí se buscaría el stock en el mapa pre-cargado.
+                    // Por ahora, los dejamos para que syncPromoStocks los maneje.
+                    'stock_gdl' => $apiVariant['stockGDL'] ?? 0, 
+                    'stock_mty' => $apiVariant['stockMTY'] ?? 0,
+                    'stock_edomex' => $apiVariant['stockEDOMEX'] ?? 0,
+                ];
+                for ($i = 0; $i < 9; $i++) {
+                    $imgKey = ($i == 0) ? 'image' : 'image_' . ($i + 1);
+                    $variantData[$imgKey] = $apiVariant['imagenesHijo'][$i] ?? null;
+                }
+
+                if (isset($apiVariant['estatus'])) {
+                    $variantData['active'] = ((string)$apiVariant['estatus'] === '1' || strtoupper((string)$apiVariant['estatus']) === 'A') ? 1 : 0;
+                }
+                $variantData = array_filter($variantData, fn($value) => $value !== null);
+
+                $existingLocalVariant = $this->variantModel->findBySku($skuHijo); // Buscar por SKU normalizado
+                if ($existingLocalVariant) {
+                    $variantIdLocal = $existingLocalVariant['id'];
+                    CLI::write("       - SKU Hijo {$skuHijo} encontrado BD (ID: {$variantIdLocal}). Actualizando...", 'dark_gray');
+                    if ($this->variantModel->update($variantIdLocal, $variantData)) {
+                        CLI::write("         - Variante ID {$variantIdLocal} actualizada.", 'light_green');
+                        $updated++;
+                    } else {
+                        CLI::error("         - ERR al actualizar variante ID {$variantIdLocal}.");
+                        $this->logger->error("[promo:fetch][Var] Err DB actualizar Variant SKU {$skuHijo}: " . json_encode($this->variantModel->errors()));
+                        $errors++;
+                    }
+                } else {
+                    CLI::write("       - SKU Hijo {$skuHijo} NO encontrado BD. Creando...", 'cyan');
+                    if (!isset($variantData['active']) && in_array('active', $this->variantModel->allowedFields ?? [])) {
+                        $variantData['active'] = 1; 
+                    }
+                    if ($this->variantModel->insert($variantData)) {
+                        CLI::write("         - Nueva variante creada.", 'light_green');
+                        $created++;
+                    } else {
+                        CLI::error("         - ERR al crear variante SKU {$skuHijo}.");
+                        $this->logger->error("[promo:fetch][Var] Err DB insertar Variant SKU {$skuHijo}: " . json_encode($this->variantModel->errors()));
+                        $errors++;
+                    }
+                }
+            } catch (\Throwable $e) {
+                CLI::error("     - ERROR procesando SKU Hijo {$skuHijo}: " . $e->getMessage());
+                $this->logger->error("[promo:fetch][Var] Excepción SKU Hijo {$skuHijo}. ParentID: {$parentIdLocal}. File: " . $e->getFile() . " Line: " . $e->getLine());
+                $errors++;
+            }
+        }
+        return [$created, $updated, $errors];
+    }
+
+    protected function syncPromoStocks(): void
+    {
+        CLI::write('Llamando a PromoopcionService->getStocks()...', 'cyan');
+        $apiStocks = $this->promoService->getStocks();
+
+        if ($apiStocks === null) {
+            CLI::error('Fallo al obtener stocks de la API de Promoopción. Ver logs del servicio.');
+            return;
+        }
+        if (empty($apiStocks)) {
+            CLI::write('No se encontraron datos de stock en la API de Promoopción.', 'yellow');
+            return;
+        }
+        CLI::write(count($apiStocks) . ' entradas de stock recibidas de la API.', 'cyan');
+
+        $updatedStockCount = 0; $notFoundSkuCount = 0; $errorUpdateCount = 0;
+        $processedStockEntries = 0; $unchangedStockCount = 0;
+        
+        $notFoundSkuList_temp = []; 
+
+        foreach ($apiStocks as $stockEntry) {
+            $processedStockEntries++;
+            $rawMaterialSku = $stockEntry['Material'] ?? null; // SKU tal como viene de la API all-stocks
+            $stockQty = isset($stockEntry['Stock']) ? (int)$stockEntry['Stock'] : null;
+            $planta = isset($stockEntry['Planta']) ? strtoupper(trim($stockEntry['Planta'])) : '';
+
+            if (empty($rawMaterialSku) || $stockQty === null || empty($planta)) {
+                CLI::write("  - Entrada de stock #{$processedStockEntries} inválida. SKU:{$rawMaterialSku}, Qty:{$stockQty}, Planta:{$planta}. Saltando.", 'yellow');
+                $this->logger->warning("[promo:fetch][Stock] Entrada de stock inválida: " . json_encode($stockEntry));
+                continue;
+            }
+
+            // **** NORMALIZACIÓN DE SKU DE STOCK (eliminar guion al final) ****
+            $skuHijo = rtrim(trim($rawMaterialSku), '-');
+            // **** FIN NORMALIZACIÓN ****
+
+            $dbStockField = null;
+            switch ($planta) {
+                case 'GDL': $dbStockField = 'stock_gdl'; break;
+                case 'MTY': $dbStockField = 'stock_mty'; break;
+                case 'EDOMEX': $dbStockField = 'stock_edomex'; break;
+                default:
+                    CLI::write("  - Planta '{$planta}' desconocida para SKU {$skuHijo} (Original: '{$rawMaterialSku}'). Saltando.", 'yellow');
+                    $this->logger->warning("[promo:fetch][Stock] Planta desconocida '{$planta}' para SKU {$skuHijo} (Original: '{$rawMaterialSku}').");
+                    continue 2; 
+            }
+
+            $localVariant = $this->variantModel->findBySku($skuHijo); // Buscar por SKU normalizado
+
+            if ($localVariant) {
+                $variantIdLocal = $localVariant['id'];
+                if (isset($localVariant[$dbStockField]) && (int)$localVariant[$dbStockField] === $stockQty) {
+                    $unchangedStockCount++;
+                } else {
+                    CLI::write("  - Actualizando stock SKU {$skuHijo} (ID:{$variantIdLocal}) en {$planta} de '{$localVariant[$dbStockField]}' a: {$stockQty}", 'light_blue');
+                    if ($this->variantModel->update($variantIdLocal, [$dbStockField => $stockQty])) {
+                        $updatedStockCount++;
+                    } else {
+                        CLI::error("    - ERROR al actualizar stock SKU {$skuHijo} en BD.");
+                        $this->logger->error("[promo:fetch][Stock] Err DB stock SKU {$skuHijo}, Campo {$dbStockField}: " . json_encode($this->variantModel->errors()));
+                        $errorUpdateCount++;
+                    }
+                }
+            } else {
+                $this->logger->info("[promo:fetch][Stock] SKU de stock {$skuHijo} (Original de API Stock: '{$rawMaterialSku}', Planta: {$planta}) no encontrado en tb_variants.");
+                $notFoundSkuCount++;
+                if (!in_array($skuHijo, $notFoundSkuList_temp) && count($notFoundSkuList_temp) < 10) { 
+                    $notFoundSkuList_temp[] = $skuHijo . " (Original API Stock: " . $rawMaterialSku . ")"; // Guardar ambos para claridad
+                }
+            }
+        }
+
+        CLI::write("--- Resumen Sincronización de Stock Promoopción ---", 'green');
+        CLI::write("Entradas de stock API procesadas: " . $processedStockEntries, 'cyan');
+        CLI::write("Registros de stock que no cambiaron: " . $unchangedStockCount, 'dark_gray');
+        CLI::write("Registros de stock actualizados en BD: " . $updatedStockCount, 'green');
+        CLI::write("SKUs de stock no encontrados en BD: " . $notFoundSkuCount, $notFoundSkuCount > 0 ? 'red' : 'yellow');
+        CLI::write("Errores al actualizar stock en BD: " . $errorUpdateCount, $errorUpdateCount > 0 ? 'red' : 'yellow');
+
+        if (!empty($notFoundSkuList_temp)) {
+            $this->logger->warning("[promo:fetch][Stock][TEMP] Lista de algunos SKUs de stock (normalizados) no encontrados en tb_variants (máx 10): " . implode('; ', $notFoundSkuList_temp));
+            CLI::write("Se loguearon hasta 10 SKUs de stock no encontrados. Revisa el archivo de log de CodeIgniter para la lista.", 'magenta');
+        }
+    }
+}
